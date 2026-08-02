@@ -2703,6 +2703,136 @@ def test_build_worker_context_caps_huge_summary(kanban_home):
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Worker skill bootstrap
+# ---------------------------------------------------------------------------
+
+
+def _write_kanban_worker_skill(profile_home: Path, *, archived: bool) -> None:
+    skills_root = profile_home / "skills"
+    category = (
+        skills_root / ".archive" / "devops"
+        if archived
+        else skills_root / "devops"
+    )
+    skill_dir = category / "kanban-worker"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        """---
+name: kanban-worker
+description: Test-only Kanban worker guidance.
+---
+
+# Kanban Worker
+
+Test-only worker guidance.
+""",
+        encoding="utf-8",
+    )
+
+
+def _spawn_argv_for_profile(
+    monkeypatch,
+    tmp_path: Path,
+    profile_home: Path,
+) -> list[str]:
+    from hermes_cli import profiles
+
+    captured = {}
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        kwargs["stdout"].close()
+        return SimpleNamespace(pid=4242)
+
+    dispatcher_home = tmp_path / "dispatcher-home"
+    dispatcher_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(dispatcher_home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setattr(
+        profiles,
+        "resolve_profile_env",
+        lambda _profile: str(profile_home),
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["/fake/hermes"])
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    task = kb.Task(
+        id="test-task",
+        title="test",
+        body=None,
+        assignee="worker",
+        status="running",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path=str(workspace),
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+        skills=["kanban-worker", "extra-skill"],
+    )
+
+    assert kb._default_spawn(task, str(workspace)) == 4242
+    return captured["argv"]
+
+
+def _skill_pair_count(argv: list[str], skill_name: str) -> int:
+    return sum(
+        argv[index : index + 2] == ["--skills", skill_name]
+        for index in range(len(argv) - 1)
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile_state", "expected_available"),
+    [
+        ("archived", False),
+        ("active", True),
+        ("empty", False),
+    ],
+)
+def test_worker_skill_bootstrap_matches_real_loader(
+    monkeypatch,
+    tmp_path,
+    profile_state,
+    expected_available,
+):
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from tools import skill_usage, skills_tool
+
+    profile_home = tmp_path / f"profile-{profile_state}"
+    (profile_home / "skills").mkdir(parents=True)
+    if profile_state != "empty":
+        _write_kanban_worker_skill(
+            profile_home,
+            archived=profile_state == "archived",
+        )
+
+    skills_root = profile_home / "skills"
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_root)
+    monkeypatch.setattr(skill_usage, "bump_use", lambda _name: None)
+
+    assert kb._kanban_worker_skill_available(str(profile_home)) is expected_available
+
+    _prompt, loaded, missing = build_preloaded_skills_prompt(["kanban-worker"])
+    if expected_available:
+        assert loaded == ["kanban-worker"]
+        assert missing == []
+    else:
+        assert loaded == []
+        assert missing == ["kanban-worker"]
+
+    argv = _spawn_argv_for_profile(monkeypatch, tmp_path, profile_home)
+    assert _skill_pair_count(argv, "kanban-worker") == int(expected_available)
+    assert _skill_pair_count(argv, "extra-skill") == 1
+
+
 def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
     """The dispatcher's _default_spawn must include --skills kanban-worker
     in its argv so every worker loads the skill automatically, even if

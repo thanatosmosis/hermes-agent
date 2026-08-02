@@ -6561,23 +6561,21 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     """
     from pathlib import Path as _Path
 
+    from agent.skill_utils import iter_skill_index_files
+
     # An unset HERMES_HOME means the worker falls back to the default root
     # home (``~/.hermes``), which ships the bundled skill.
     base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
     skills_root = base / "skills"
     if not skills_root.is_dir():
         return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
     try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
-                return True
+        return any(
+            skill_md.parent.name == "kanban-worker"
+            for skill_md in iter_skill_index_files(skills_root, "SKILL.md")
+        )
     except OSError:
-        pass
-    return False
+        return False
 
 
 def _worker_terminal_timeout_env(
