@@ -1,0 +1,20 @@
+# Dormant opt-in templates for the governed review-efficiency candidate.
+# This file is data only. It is not imported, installed, or activated.
+version: 1
+enabled: false
+target:
+  repository: thanatosmosis/Vacation-Bid-V2
+  issue: 2
+rollback: "disable both templates; revert the isolated candidate commit; preserve Kanban events"
+jobs:
+  - name: governed-review-worker-hourly
+    enabled: false
+    schedule: "1 * * * *"
+    profile: r4k7
+    task_max_runtime_seconds: 180
+    prompt: "Run one preflighted governed review worker tick; stop on a substantive blocker."
+  - name: governed-review-b1-review-hourly
+    enabled: false
+    schedule: "15 * * * *"
+    profile: B1-DO
+    prompt: "Review durable governed-worker evidence; release at most one explicitly selected child."

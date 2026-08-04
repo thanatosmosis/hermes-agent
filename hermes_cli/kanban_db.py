@@ -3568,6 +3568,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    recompute_dependents: bool = True,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -3581,6 +3582,11 @@ def complete_task(
     callers do not have to pass both. ``metadata`` is a free-form dict
     (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
     are encouraged to use it for structured handoff facts.
+
+    ``recompute_dependents`` defaults to the historical behavior: all eligible
+    descendants are reconsidered after completion. Governed workflows can set
+    it to ``False`` and explicitly promote one reviewed child at a time without
+    changing the behavior of existing callers.
 
     ``created_cards`` is an optional list of task ids the completing
     worker claims to have created. Each id is verified against
@@ -3734,8 +3740,10 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
-    # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    # Recompute ready status for dependents unless an opt-in governed caller
+    # will explicitly release reviewed children one at a time.
+    if recompute_dependents:
+        recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True
