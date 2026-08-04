@@ -120,6 +120,7 @@ def _default_skill_resolver(profile: str, skill: str) -> bool:
 
 
 def _default_delivery_readiness(target: GitHubIssueTarget) -> tuple[bool, str]:
+    """Non-mutating proof that the authenticated viewer may comment."""
     if shutil.which("gh") is None:
         return False, "gh executable is unavailable"
     auth = subprocess.run(
@@ -132,19 +133,51 @@ def _default_delivery_readiness(target: GitHubIssueTarget) -> tuple[bool, str]:
     )
     if auth.returncode != 0:
         return False, "gh authentication unavailable"
-    issue = subprocess.run(
+
+    owner, name = target.repository.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){viewerPermission "
+        "issue(number:$number){number viewerCanUpdate}}}"
+    )
+    permission = subprocess.run(
         [
-            "gh", "issue", "view", str(target.issue),
-            "--repo", target.repository, "--json", "number",
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={int(target.issue)}",
         ],
         text=True,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         timeout=15,
         check=False,
     )
-    if issue.returncode != 0:
-        return False, "configured GitHub issue is not readable"
+    if permission.returncode != 0:
+        return False, "configured GitHub issue comment permission is unavailable"
+    try:
+        payload = json.loads(permission.stdout or "{}")
+        repository = payload["data"]["repository"]
+        issue = repository["issue"]
+        viewer_permission = repository["viewerPermission"]
+        viewer_can_update = issue["viewerCanUpdate"]
+        issue_number = issue["number"]
+    except (KeyError, TypeError, ValueError):
+        return False, "configured GitHub issue comment permission could not be verified"
+    write_permissions = {"WRITE", "MAINTAIN", "ADMIN"}
+    if (
+        viewer_permission not in write_permissions
+        or viewer_can_update is not True
+        or issue_number != int(target.issue)
+    ):
+        return False, "authenticated viewer lacks verified issue-comment capability"
     return True, "ready"
 
 
@@ -251,6 +284,35 @@ def _dedupe_key(spec: GovernedReviewSpec, prompt_hash: str) -> str:
     return f"governed-review:{_sha256(material)}"
 
 
+def _preflight_identity(
+    spec: GovernedReviewSpec,
+    prompt_hash: str,
+    dedupe: str,
+) -> dict[str, Any]:
+    return {
+        "task_id": spec.task_id,
+        "workspace": str(spec.workspace.resolve()),
+        "expected_commit": spec.expected_commit,
+        "expected_branch": spec.expected_branch,
+        "delivery_target": f"{spec.delivery.repository}#{spec.delivery.issue}",
+        "prompt_hash": prompt_hash,
+        "dedupe_key": dedupe,
+    }
+
+
+def _governance_gate_events(conn, task_id: str):
+    kinds = {
+        "governance_preflight_passed",
+        "governance_preflight_blocked",
+        "governance_execution_blocked",
+    }
+    return [event for event in _events(conn, task_id) if event.kind in kinds]
+
+
+def _payload_matches_identity(payload: Optional[dict[str, Any]], identity: dict[str, Any]) -> bool:
+    return bool(payload) and all(payload.get(key) == value for key, value in identity.items())
+
+
 def preflight_governed_review(
     conn,
     spec: GovernedReviewSpec,
@@ -282,30 +344,38 @@ def preflight_governed_review(
     }
 
     if task is None:
-        errors.append(f"task {spec.task_id} does not exist")
-    else:
-        evidence["actual_profile"] = task.assignee
-        evidence["requested_skills"] = list(task.skills or [])
-        missing: list[str] = []
-        if not task.assignee or not profile_resolver(task.assignee):
-            errors.append(f"actual assignee profile does not exist: {task.assignee!r}")
-        else:
-            missing = [
-                skill for skill in (task.skills or [])
-                if not skill_resolver(task.assignee, skill)
-            ]
-        if missing:
-            errors.append(f"requested skills do not resolve for {task.assignee}: {', '.join(missing)}")
+        return PreflightResult(
+            False,
+            (f"task {spec.task_id} does not exist",),
+            evidence,
+            dedupe,
+        )
 
-        parent_rows = conn.execute(
-            "SELECT p.id, p.status FROM tasks p JOIN task_links l ON l.parent_id=p.id "
-            "WHERE l.child_id=? ORDER BY p.id",
-            (spec.task_id,),
-        ).fetchall()
-        evidence["dependencies"] = [dict(row) for row in parent_rows]
-        open_parents = [row["id"] for row in parent_rows if row["status"] not in ("done", "archived")]
-        if open_parents:
-            errors.append(f"unsatisfied dependencies: {', '.join(open_parents)}")
+    evidence["actual_profile"] = task.assignee
+    evidence["requested_skills"] = list(task.skills or [])
+    missing: list[str] = []
+    if not task.assignee or not profile_resolver(task.assignee):
+        errors.append(f"actual assignee profile does not exist: {task.assignee!r}")
+    else:
+        missing = [
+            skill for skill in (task.skills or [])
+            if not skill_resolver(task.assignee, skill)
+        ]
+    if missing:
+        errors.append(f"requested skills do not resolve for {task.assignee}: {', '.join(missing)}")
+
+    parent_rows = conn.execute(
+        "SELECT p.id, p.status FROM tasks p JOIN task_links l ON l.parent_id=p.id "
+        "WHERE l.child_id=? ORDER BY p.id",
+        (spec.task_id,),
+    ).fetchall()
+    evidence["dependencies"] = [dict(row) for row in parent_rows]
+    open_parents = [
+        row["id"] for row in parent_rows
+        if row["status"] not in ("done", "archived")
+    ]
+    if open_parents:
+        errors.append(f"unsatisfied dependencies: {', '.join(open_parents)}")
 
     target_error = spec.delivery.validate()
     if target_error:
@@ -326,7 +396,7 @@ def preflight_governed_review(
     else:
         head = _run_git(workspace, "rev-parse", "HEAD")
         branch = _run_git(workspace, "branch", "--show-current")
-        status = _run_git(workspace, "status", "--porcelain=v1", "--untracked-files=no")
+        status = _run_git(workspace, "status", "--porcelain=v1")
         if head.returncode != 0 or status.returncode != 0 or branch.returncode != 0:
             errors.append("workspace is not a readable git worktree")
         else:
@@ -344,24 +414,30 @@ def preflight_governed_review(
                     f"branch mismatch: expected {spec.expected_branch}, got {actual_branch}"
                 )
             if status.stdout.strip():
-                errors.append("tracked or staged worktree state is not clean")
+                errors.append(
+                    "tracked or staged worktree state is not clean; "
+                    "untracked material is also forbidden"
+                )
 
     result = PreflightResult(not errors, tuple(errors), evidence, dedupe)
+    gate_events = _governance_gate_events(conn, spec.task_id)
+    latest_gate = gate_events[-1] if gate_events else None
+    identity = _preflight_identity(spec, prompt_hash, dedupe)
     if result.ok:
-        prior = [
-            event for event in _events(conn, spec.task_id, "governance_preflight_passed")
-            if (event.payload or {}).get("dedupe_key") == dedupe
-        ]
-        if not prior:
+        if (
+            latest_gate is None
+            or latest_gate.kind != "governance_preflight_passed"
+            or not _payload_matches_identity(latest_gate.payload, identity)
+        ):
             _append(conn, spec.task_id, "governance_preflight_passed", evidence)
         return result
 
     blocker_key = f"preflight:{dedupe}"
-    prior = [
-        event for event in _events(conn, spec.task_id, "governance_preflight_blocked")
-        if (event.payload or {}).get("blocker_key") == blocker_key
-    ]
-    if not prior:
+    if (
+        latest_gate is None
+        or latest_gate.kind != "governance_preflight_blocked"
+        or (latest_gate.payload or {}).get("blocker_key") != blocker_key
+    ):
         payload = dict(evidence)
         payload.update({"blocker_key": blocker_key, "errors": list(errors)})
         _append(conn, spec.task_id, "governance_preflight_blocked", payload)
@@ -405,6 +481,166 @@ def release_one_child(conn, parent_id: str, child_id: str, *, actor: str) -> tup
     return ok, error
 
 
+def _active_block_reason(events) -> Optional[str]:
+    state_events = [event for event in events if event.kind in ("blocked", "unblocked")]
+    if not state_events or state_events[-1].kind != "blocked":
+        return None
+    return str((state_events[-1].payload or {}).get("reason") or "")
+
+
+def _execution_gate_errors(
+    conn,
+    spec: GovernedReviewSpec,
+    *,
+    task,
+    prompt_hash: str,
+    dedupe: str,
+    product_already_completed: bool,
+    delivery_readiness: ReadinessProbe,
+) -> list[str]:
+    errors: list[str] = []
+    identity = _preflight_identity(spec, prompt_hash, dedupe)
+    gate_events = _governance_gate_events(conn, spec.task_id)
+    latest_gate = gate_events[-1] if gate_events else None
+    if (
+        latest_gate is None
+        or latest_gate.kind != "governance_preflight_passed"
+        or not _payload_matches_identity(latest_gate.payload, identity)
+    ):
+        return ["no current matching successful governance preflight"]
+
+    preflight_payload = latest_gate.payload or {}
+    if preflight_payload.get("actual_profile") != task.assignee:
+        errors.append("task assignee changed after governance preflight")
+    if preflight_payload.get("requested_skills") != list(task.skills or []):
+        errors.append("task skills changed after governance preflight")
+    parent_rows = conn.execute(
+        "SELECT p.id, p.status FROM tasks p JOIN task_links l ON l.parent_id=p.id "
+        "WHERE l.child_id=? ORDER BY p.id",
+        (spec.task_id,),
+    ).fetchall()
+    open_parents = [
+        row["id"] for row in parent_rows
+        if row["status"] not in ("done", "archived")
+    ]
+    if open_parents:
+        errors.append(f"unsatisfied dependencies: {', '.join(open_parents)}")
+
+    events = _events(conn, spec.task_id)
+    if task.status == "blocked":
+        indexed_events = list(enumerate(events))
+        state_events = [
+            (index, event)
+            for index, event in indexed_events
+            if event.kind in ("blocked", "unblocked")
+        ]
+        active_block = (
+            state_events[-1]
+            if state_events and state_events[-1][1].kind == "blocked"
+            else None
+        )
+        last_unblocked_index = max(
+            (
+                index
+                for index, event in state_events
+                if event.kind == "unblocked"
+            ),
+            default=-1,
+        )
+        matching_delivery_failures = [
+            (index, event)
+            for index, event in indexed_events
+            if event.kind == "governance_delivery_failed"
+            and (event.payload or {}).get("dedupe_key") == dedupe
+            and active_block is not None
+            and last_unblocked_index < index < active_block[0]
+        ]
+        matching_delivery_failure = (
+            matching_delivery_failures[-1] if matching_delivery_failures else None
+        )
+        block_reason = (
+            str((active_block[1].payload or {}).get("reason") or "")
+            if active_block is not None
+            else ""
+        )
+        delivery_error = (
+            str((matching_delivery_failure[1].payload or {}).get("error") or "")
+            if matching_delivery_failure is not None
+            else ""
+        )
+        delivery_retry_state = (
+            product_already_completed
+            and matching_delivery_failure is not None
+            and bool(delivery_error)
+            and block_reason == f"delivery-failed: {delivery_error[:300]}"
+        )
+        if not delivery_retry_state:
+            errors.append("task is blocked by a substantive hold")
+    elif task.status not in ("running", "ready"):
+        errors.append(f"task status does not permit governed execution: {task.status}")
+
+    workspace = spec.workspace.resolve()
+    if not workspace.is_dir():
+        errors.append(f"workspace does not exist: {workspace}")
+    else:
+        head = _run_git(workspace, "rev-parse", "HEAD")
+        branch = _run_git(workspace, "branch", "--show-current")
+        status = _run_git(workspace, "status", "--porcelain=v1")
+        if head.returncode != 0 or branch.returncode != 0 or status.returncode != 0:
+            errors.append("workspace is not a readable git worktree")
+        else:
+            actual_commit = head.stdout.strip()
+            actual_branch = branch.stdout.strip()
+            if actual_commit != spec.expected_commit:
+                errors.append(
+                    f"immutable commit pin mismatch: expected {spec.expected_commit}, "
+                    f"got {actual_commit}"
+                )
+            if spec.expected_branch and actual_branch != spec.expected_branch:
+                errors.append(
+                    f"branch mismatch: expected {spec.expected_branch}, got {actual_branch}"
+                )
+            if status.stdout.strip():
+                errors.append("immutable worktree is not clean, including untracked material")
+
+    target_error = spec.delivery.validate()
+    if target_error:
+        errors.append(target_error)
+    else:
+        try:
+            ready, detail = delivery_readiness(spec.delivery)
+        except Exception as exc:
+            ready, detail = False, f"readiness probe failed: {exc}"
+        if not ready:
+            errors.append(f"durable GitHub issue delivery is not ready: {detail}")
+    return errors
+
+
+def _record_execution_block(
+    conn,
+    spec: GovernedReviewSpec,
+    *,
+    prompt_hash: str,
+    dedupe: str,
+    errors: list[str],
+    pause_scheduler: Optional[PauseCallback],
+) -> None:
+    blocker_key = f"execution:{dedupe}:{_sha256(json.dumps(errors, sort_keys=True))}"
+    latest_gate_events = _governance_gate_events(conn, spec.task_id)
+    latest_gate = latest_gate_events[-1] if latest_gate_events else None
+    if (
+        latest_gate is not None
+        and latest_gate.kind == "governance_execution_blocked"
+        and (latest_gate.payload or {}).get("blocker_key") == blocker_key
+    ):
+        return
+    payload = _preflight_identity(spec, prompt_hash, dedupe)
+    payload.update({"blocker_key": blocker_key, "errors": list(errors)})
+    _append(conn, spec.task_id, "governance_execution_blocked", payload)
+    _sticky_block_once(conn, spec.task_id, "governance-execution: " + "; ".join(errors))
+    _pause_once(conn, spec.task_id, blocker_key, "; ".join(errors), pause_scheduler)
+
+
 def complete_with_issue_delivery(
     conn,
     spec: GovernedReviewSpec,
@@ -412,6 +648,7 @@ def complete_with_issue_delivery(
     summary: str,
     product_work: ProductCallback,
     sender: DeliverySender = _default_delivery_sender,
+    delivery_readiness: ReadinessProbe = _default_delivery_readiness,
     pause_scheduler: Optional[PauseCallback] = None,
 ) -> bool:
     """Persist product evidence, deliver once, then complete without fan-out.
@@ -422,17 +659,41 @@ def complete_with_issue_delivery(
     """
     prompt_hash = _sha256(spec.prompt)
     dedupe = _dedupe_key(spec, prompt_hash)
+    task = kb.get_task(conn, spec.task_id)
+    if task is None:
+        return False
+
     success_events = [
         event for event in _events(conn, spec.task_id, "governance_delivery_succeeded")
         if (event.payload or {}).get("dedupe_key") == dedupe
     ]
-    if kb.get_task(conn, spec.task_id) and kb.get_task(conn, spec.task_id).status == "done":
+    if task.status == "done":
         return bool(success_events)
 
     product_events = [
         event for event in _events(conn, spec.task_id, "governance_product_completed")
         if (event.payload or {}).get("dedupe_key") == dedupe
     ]
+    gate_errors = _execution_gate_errors(
+        conn,
+        spec,
+        prompt_hash=prompt_hash,
+        dedupe=dedupe,
+        task=task,
+        product_already_completed=bool(product_events),
+        delivery_readiness=delivery_readiness,
+    )
+    if gate_errors:
+        _record_execution_block(
+            conn,
+            spec,
+            prompt_hash=prompt_hash,
+            dedupe=dedupe,
+            errors=gate_errors,
+            pause_scheduler=pause_scheduler,
+        )
+        return False
+
     if not product_events:
         try:
             evidence = product_work()
@@ -563,15 +824,40 @@ def request_preserved_state_recovery(
         return False, "preserved-state recovery already used"
     if task.status != "blocked":
         return False, f"task must be blocked, got {task.status}"
+
+    events = _events(conn, task_id)
+    active_block_reason = _active_block_reason(events)
+    if active_block_reason is not None:
+        return False, f"preserved-state recovery refuses substantive hold: {active_block_reason}"
+
+    breaker_events = [
+        event for event in events if event.kind == "gave_up"
+    ]
+    matching_breaker_events = [
+        event
+        for event in breaker_events
+        if (event.payload or {}).get("error") == task.last_failure_error
+        and (
+            (event.payload or {}).get("failures") is None
+            or (event.payload or {}).get("failures") == task.consecutive_failures
+        )
+    ]
+    if (
+        task.consecutive_failures <= 0
+        or not task.last_failure_error
+        or not matching_breaker_events
+    ):
+        return False, "preserved-state recovery requires durable operational failure evidence"
+
     failure_events = [
         {
             "kind": event.kind,
             "created_at": event.created_at,
             "payload": event.payload,
         }
-        for event in _events(conn, task_id)
-        if event.kind in ("gave_up", "timed_out", "crashed", "spawn_failed")
+        for event in matching_breaker_events
     ]
+
     evidence = {
         "actor": actor,
         "reason": reason,

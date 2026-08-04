@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -52,6 +53,31 @@ def make_spec(task_id: str, workspace: Path, head: str, branch: str) -> gr.Gover
         session_id="session-test",
         model="test-model",
         metadata={"candidate": True},
+    )
+
+
+def delivery_ready(target: gr.GitHubIssueTarget) -> tuple[bool, str]:
+    return True, f"comment-ready:{target.repository}#{target.issue}"
+
+
+def pass_preflight(conn, spec: gr.GovernedReviewSpec) -> gr.PreflightResult:
+    result = gr.preflight_governed_review(
+        conn,
+        spec,
+        profile_resolver=lambda profile: bool(profile),
+        skill_resolver=lambda profile, skill: True,
+        delivery_readiness=delivery_ready,
+    )
+    assert result.ok, result.errors
+    return result
+
+
+def complete_ready(conn, spec: gr.GovernedReviewSpec, **kwargs) -> bool:
+    return gr.complete_with_issue_delivery(
+        conn,
+        spec,
+        delivery_readiness=delivery_ready,
+        **kwargs,
     )
 
 
@@ -120,6 +146,42 @@ def test_preflight_fail_closed_is_single_durable_block_and_scheduler_pause(
     assert any("tracked or staged" in error for error in errors)
 
 
+def test_preflight_rejects_untracked_material(conn, git_workspace) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    (workspace / "untracked.txt").write_text("not immutable\n", encoding="utf-8")
+
+    result = gr.preflight_governed_review(
+        conn,
+        make_spec(task_id, workspace, head, branch),
+        profile_resolver=lambda profile: True,
+        delivery_readiness=delivery_ready,
+    )
+
+    assert not result.ok
+    assert result.evidence["tracked_or_staged_clean"] is False
+    assert any("worktree state is not clean" in error for error in result.errors)
+
+
+def test_preflight_nonexistent_task_returns_controlled_result_without_audit_write(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+    probes: list[str] = []
+
+    result = gr.preflight_governed_review(
+        conn,
+        make_spec("t_doesnotexist", workspace, head, branch),
+        profile_resolver=lambda profile: probes.append(profile) or True,
+        delivery_readiness=lambda target: probes.append(target.repository) or (True, "ready"),
+    )
+
+    assert not result.ok
+    assert result.errors == ("task t_doesnotexist does not exist",)
+    assert probes == []
+    assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 0
+
+
 def test_review_required_is_terminal_sticky_and_does_not_release_descendant(conn) -> None:
     parent = kb.create_task(conn, title="parent", assignee="worker")
     child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
@@ -134,6 +196,155 @@ def test_review_required_is_terminal_sticky_and_does_not_release_descendant(conn
     assert gr.release_one_child(conn, parent, child, actor="reviewer")[0] is False
 
 
+def test_product_work_requires_current_matching_preflight_for_same_task_and_spec(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+    preflight_task = kb.create_task(conn, title="preflight", assignee="worker")
+    target_task = kb.create_task(conn, title="target", assignee="worker")
+    assert kb.claim_task(conn, preflight_task)
+    assert kb.claim_task(conn, target_task)
+    pass_preflight(conn, make_spec(preflight_task, workspace, head, branch))
+    product_calls: list[str] = []
+
+    assert not complete_ready(
+        conn,
+        make_spec(target_task, workspace, head, branch),
+        summary="must not run",
+        product_work=lambda: product_calls.append("ran") or {},
+        sender=lambda target, body: None,
+    )
+
+    assert product_calls == []
+    assert len(gr._events(conn, target_task, "governance_execution_blocked")) == 1
+
+
+def test_product_work_refuses_review_required_hold_after_successful_preflight(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    assert kb.claim_task(conn, task_id)
+    spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
+    assert gr.hold_for_review(conn, task_id, "human sign-off")
+    product_calls: list[str] = []
+
+    assert not complete_ready(
+        conn,
+        spec,
+        summary="must not run",
+        product_work=lambda: product_calls.append("ran") or {},
+        sender=lambda target, body: None,
+    )
+
+    assert product_calls == []
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_delivery_only_retry_refuses_changed_immutable_state_without_rerunning_product(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    assert kb.claim_task(conn, task_id)
+    spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
+    product_calls: list[str] = []
+    sends: list[str] = []
+
+    def product_work():
+        product_calls.append("ran")
+        return {"commit": head}
+
+    def sender(target, body):
+        sends.append(body)
+        raise RuntimeError("offline")
+
+    assert not complete_ready(
+        conn, spec, summary="done", product_work=product_work, sender=sender
+    )
+    (workspace / "untracked-after-product.txt").write_text("drift\n", encoding="utf-8")
+    assert not complete_ready(
+        conn, spec, summary="done", product_work=product_work, sender=sender
+    )
+    assert product_calls == ["ran"]
+    assert len(sends) == 1
+
+
+def test_delivery_only_retry_refuses_lost_comment_capability_without_rerunning_product(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    assert kb.claim_task(conn, task_id)
+    spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
+    product_calls: list[str] = []
+    sends: list[str] = []
+
+    def product_work():
+        product_calls.append("ran")
+        return {"commit": head}
+
+    def sender(target, body):
+        sends.append(body)
+        raise RuntimeError("offline")
+
+    assert not complete_ready(
+        conn, spec, summary="done", product_work=product_work, sender=sender
+    )
+    assert not gr.complete_with_issue_delivery(
+        conn,
+        spec,
+        summary="done",
+        product_work=product_work,
+        sender=sender,
+        delivery_readiness=lambda target: (False, "comment permission revoked"),
+    )
+    assert product_calls == ["ran"]
+    assert len(sends) == 1
+
+
+def test_delivery_only_retry_refuses_replayed_delivery_hold_without_rerunning_product(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    assert kb.claim_task(conn, task_id)
+    spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
+    product_calls: list[str] = []
+    sends: list[str] = []
+
+    def product_work():
+        product_calls.append("ran")
+        return {"commit": head}
+
+    def sender(target, body):
+        sends.append(body)
+        raise RuntimeError("offline")
+
+    assert not complete_ready(
+        conn, spec, summary="done", product_work=product_work, sender=sender
+    )
+    assert kb.unblock_task(conn, task_id)
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason="delivery-failed: offline",
+        expected_run_id=task.current_run_id,
+    )
+
+    assert not complete_ready(
+        conn, spec, summary="done", product_work=product_work, sender=sender
+    )
+    assert product_calls == ["ran"]
+    assert len(sends) == 1
+
+
 def test_delivery_retry_is_idempotent_does_not_rerun_product_and_releases_one_child(
     conn, git_workspace
 ) -> None:
@@ -143,6 +354,7 @@ def test_delivery_retry_is_idempotent_does_not_rerun_product_and_releases_one_ch
     child_b = kb.create_task(conn, title="child-b", assignee="worker", parents=[parent])
     assert kb.claim_task(conn, parent)
     spec = make_spec(parent, workspace, head, branch)
+    pass_preflight(conn, spec)
     product_calls: list[str] = []
     delivery_calls: list[str] = []
 
@@ -155,13 +367,13 @@ def test_delivery_retry_is_idempotent_does_not_rerun_product_and_releases_one_ch
         if len(delivery_calls) == 1:
             raise RuntimeError("simulated GitHub outage")
 
-    assert not gr.complete_with_issue_delivery(
+    assert not complete_ready(
         conn, spec, summary="candidate complete", product_work=product_work, sender=flaky_sender
     )
     assert kb.get_task(conn, parent).status == "blocked"
     assert len(product_calls) == 1
 
-    assert gr.complete_with_issue_delivery(
+    assert complete_ready(
         conn, spec, summary="candidate complete", product_work=product_work, sender=flaky_sender
     )
     assert kb.get_task(conn, parent).status == "done"
@@ -184,7 +396,7 @@ def test_delivery_retry_is_idempotent_does_not_rerun_product_and_releases_one_ch
     assert kb.get_task(conn, child_b).status == "blocked"
 
     # Re-entry after success is idempotent: neither product nor delivery reruns.
-    assert gr.complete_with_issue_delivery(
+    assert complete_ready(
         conn, spec, summary="candidate complete", product_work=product_work, sender=flaky_sender
     )
     assert len(product_calls) == 1
@@ -196,6 +408,7 @@ def test_delivery_exhaustion_blocks_and_pauses_without_third_send(conn, git_work
     task_id = kb.create_task(conn, title="candidate", assignee="worker")
     assert kb.claim_task(conn, task_id)
     spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
     product_calls: list[int] = []
     sends: list[int] = []
     pauses: list[str] = []
@@ -208,15 +421,15 @@ def test_delivery_exhaustion_blocks_and_pauses_without_third_send(conn, git_work
         sends.append(1)
         raise RuntimeError("offline")
 
-    assert not gr.complete_with_issue_delivery(
+    assert not complete_ready(
         conn, spec, summary="done", product_work=product_work, sender=failing_sender
     )
     # Delivery-only retry is allowed from the preserved blocked state.
-    assert not gr.complete_with_issue_delivery(
+    assert not complete_ready(
         conn, spec, summary="done", product_work=product_work, sender=failing_sender
     )
     # Third invocation is rejected before send and pauses the scheduler once.
-    assert not gr.complete_with_issue_delivery(
+    assert not complete_ready(
         conn,
         spec,
         summary="done",
@@ -269,6 +482,80 @@ def test_exhaustion_allows_one_preserved_state_recovery_and_rejects_second(conn)
     assert len(pauses) == 1
 
 
+@pytest.mark.parametrize(
+    "hold_reason",
+    [
+        "manual hold",
+        "review-required: human approval",
+        "doctrine hold",
+        "security hold",
+        "policy hold",
+        "governance-preflight: invalid state",
+        "delivery-failed: offline",
+    ],
+    ids=["manual", "review-required", "doctrine", "security", "policy", "preflight", "delivery"],
+)
+def test_preserved_recovery_refuses_substantive_holds_even_with_historical_exhaustion(
+    conn, hold_reason: str
+) -> None:
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    assert kb.claim_task(conn, task_id)
+    conn.execute(
+        "INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'gave_up', ?, 1)",
+        (task_id, '{"error":"historical exhaustion"}'),
+    )
+    conn.commit()
+    assert kb.block_task(conn, task_id, reason=hold_reason)
+
+    ok, detail = gr.request_preserved_state_recovery(
+        conn, task_id, actor="B1-DO", reason="must fail closed"
+    )
+
+    assert not ok
+    assert "substantive hold" in detail
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert gr._events(conn, task_id, "governance_preserved_recovery") == []
+
+
+def test_preserved_recovery_requires_durable_operational_failure_evidence(conn) -> None:
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+    conn.commit()
+
+    ok, detail = gr.request_preserved_state_recovery(
+        conn, task_id, actor="B1-DO", reason="no evidence"
+    )
+
+    assert not ok
+    assert "durable operational failure" in detail
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_preserved_recovery_requires_failure_evidence_matching_current_breaker(conn) -> None:
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    conn.execute(
+        "UPDATE tasks SET status='blocked', consecutive_failures=2, "
+        "last_failure_error='current failure' WHERE id=?",
+        (task_id,),
+    )
+    conn.execute(
+        "INSERT INTO task_events(task_id, kind, payload, created_at) "
+        "VALUES (?, 'gave_up', ?, 1)",
+        (task_id, '{"error":"historical failure","failures":2}'),
+    )
+    conn.commit()
+
+    ok, detail = gr.request_preserved_state_recovery(
+        conn, task_id, actor="B1-DO", reason="mismatched evidence"
+    )
+
+    assert not ok
+    assert "durable operational failure" in detail
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "blocked"
+
+
 def test_complete_task_default_release_is_unchanged_and_opt_out_is_explicit(conn) -> None:
     parent_default = kb.create_task(conn, title="default parent")
     child_default = kb.create_task(conn, title="default child", parents=[parent_default])
@@ -288,13 +575,14 @@ def test_product_failure_blocks_and_pauses_without_delivery(conn, git_workspace)
     task_id = kb.create_task(conn, title="candidate", assignee="worker")
     assert kb.claim_task(conn, task_id)
     spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
     sends: list[str] = []
     pauses: list[str] = []
 
     def product_work():
         raise RuntimeError("deterministic build failure")
 
-    assert not gr.complete_with_issue_delivery(
+    assert not complete_ready(
         conn,
         spec,
         summary="not done",
@@ -308,6 +596,56 @@ def test_product_failure_blocks_and_pauses_without_delivery(conn, git_workspace)
     assert not sends
     assert len(pauses) == 1
     assert len(gr._events(conn, task_id, "governance_product_failed")) == 1
+
+
+@pytest.mark.parametrize(
+    ("viewer_permission", "viewer_can_update", "expected_ready"),
+    [
+        ("WRITE", True, True),
+        ("ADMIN", True, True),
+        ("READ", True, False),
+        ("WRITE", False, False),
+        (None, True, False),
+    ],
+)
+def test_default_readiness_proves_sufficient_comment_permission_without_probe_comment(
+    monkeypatch,
+    viewer_permission: str | None,
+    viewer_can_update: bool,
+    expected_ready: bool,
+) -> None:
+    target = gr.GitHubIssueTarget("owner/repo", 2)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(gr.shutil, "which", lambda executable: "/usr/bin/gh")
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if command[:3] == ["gh", "auth", "status"]:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        assert command[:3] == ["gh", "api", "graphql"]
+        assert any("viewerPermission" in arg for arg in command)
+        assert any("viewerCanUpdate" in arg for arg in command)
+        payload = {
+            "data": {
+                "repository": {
+                    "viewerPermission": viewer_permission,
+                    "issue": {
+                        "number": 2,
+                        "viewerCanUpdate": viewer_can_update,
+                    },
+                }
+            }
+        }
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ready, detail = gr._default_delivery_readiness(target)
+
+    assert ready is expected_ready
+    assert (detail == "ready") is expected_ready
+    assert len(commands) == 2
+    assert all("comment" not in command for command in commands)
+    assert all("issue" not in command or "view" not in command for command in commands)
 
 
 def test_default_sender_uses_comment_marker_as_remote_dedupe(monkeypatch) -> None:
