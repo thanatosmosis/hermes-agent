@@ -37,14 +37,25 @@ def git_workspace(tmp_path: Path) -> tuple[Path, str, str]:
         subprocess.run(command, cwd=workspace, check=True, capture_output=True)
     (workspace / "tracked.txt").write_text("baseline\n", encoding="utf-8")
     subprocess.run(["git", "add", "tracked.txt"], cwd=workspace, check=True)
-    subprocess.run(["git", "commit", "-m", "baseline"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "baseline"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
     head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=workspace, check=True, text=True, capture_output=True
+        ["git", "rev-parse", "HEAD"],
+        cwd=workspace,
+        check=True,
+        text=True,
+        capture_output=True,
     ).stdout.strip()
     return workspace, head, "candidate"
 
 
-def make_spec(task_id: str, workspace: Path, head: str, branch: str) -> gr.GovernedReviewSpec:
+def make_spec(
+    task_id: str, workspace: Path, head: str, branch: str
+) -> gr.GovernedReviewSpec:
     return gr.GovernedReviewSpec(
         task_id=task_id,
         workspace=workspace,
@@ -60,6 +71,12 @@ def make_spec(task_id: str, workspace: Path, head: str, branch: str) -> gr.Gover
 
 def delivery_ready(target: gr.GitHubIssueTarget) -> tuple[bool, str]:
     return True, f"comment-ready:{target.repository}#{target.issue}"
+
+
+def require_task(conn, task_id: str) -> kb.Task:
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    return task
 
 
 def pass_preflight(conn, spec: gr.GovernedReviewSpec) -> gr.PreflightResult:
@@ -102,9 +119,10 @@ def test_preflight_passes_with_exact_pin_profile_skills_dependencies_and_deliver
         conn,
         make_spec(task_id, workspace, head, branch),
         profile_resolver=lambda profile: profile == "r4k7",
-        skill_resolver=lambda profile, skill: profile == "r4k7" and skill in {
-            "kanban-operations", "software-development-workflows"
-        },
+        skill_resolver=lambda profile, skill: (
+            profile == "r4k7"
+            and skill in {"kanban-operations", "software-development-workflows"}
+        ),
         delivery_readiness=lambda target: (target.issue == 2, "stub-ready"),
     )
 
@@ -191,7 +209,7 @@ def test_preflight_fail_closed_is_single_durable_block_and_scheduler_pause(
         )
         assert not result.ok
 
-    assert kb.get_task(conn, task_id).status == "blocked"
+    assert require_task(conn, task_id).status == "blocked"
     assert len(gr._events(conn, task_id, "governance_preflight_blocked")) == 1
     assert len(gr._events(conn, task_id, "blocked")) == 1
     assert len(gr._events(conn, task_id, "governance_scheduler_paused")) == 1
@@ -229,7 +247,9 @@ def test_preflight_nonexistent_task_returns_controlled_result_without_audit_writ
         conn,
         make_spec("t_doesnotexist", workspace, head, branch),
         profile_resolver=lambda profile: probes.append(profile) or True,
-        delivery_readiness=lambda target: probes.append(target.repository) or (True, "ready"),
+        delivery_readiness=lambda target: (
+            probes.append(target.repository) or (True, "ready")
+        ),
     )
 
     assert not result.ok
@@ -238,7 +258,9 @@ def test_preflight_nonexistent_task_returns_controlled_result_without_audit_writ
     assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 0
 
 
-def test_review_required_is_terminal_sticky_and_does_not_release_descendant(conn) -> None:
+def test_review_required_is_terminal_sticky_and_does_not_release_descendant(
+    conn,
+) -> None:
     parent = kb.create_task(conn, title="parent", assignee="worker")
     child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
     claimed = kb.claim_task(conn, parent)
@@ -247,8 +269,8 @@ def test_review_required_is_terminal_sticky_and_does_not_release_descendant(conn
 
     for _ in range(3):
         assert kb.recompute_ready(conn) == 0
-    assert kb.get_task(conn, parent).status == "blocked"
-    assert kb.get_task(conn, child).status == "todo"
+    assert require_task(conn, parent).status == "blocked"
+    assert require_task(conn, child).status == "todo"
     assert gr.release_one_child(conn, parent, child, actor="reviewer")[0] is False
 
 
@@ -295,7 +317,7 @@ def test_product_work_refuses_review_required_hold_after_successful_preflight(
     )
 
     assert product_calls == []
-    assert kb.get_task(conn, task_id).status == "blocked"
+    assert require_task(conn, task_id).status == "blocked"
 
 
 def test_delivery_only_retry_refuses_changed_immutable_state_without_rerunning_product(
@@ -469,7 +491,9 @@ def test_atomic_product_reservation_blocks_concurrent_and_reentrant_callbacks(
     assert len(gr._events(conn, task_id, "governance_product_completed")) == 1
 
 
-def test_delivery_reservation_is_atomic_under_concurrent_retry(conn, git_workspace) -> None:
+def test_delivery_reservation_is_atomic_under_concurrent_retry(
+    conn, git_workspace
+) -> None:
     workspace, head, branch = git_workspace
     task_id = kb.create_task(conn, title="candidate", assignee="worker")
     assert kb.claim_task(conn, task_id)
@@ -533,16 +557,24 @@ def test_delivery_reservation_is_atomic_under_concurrent_retry(conn, git_workspa
     assert sends == ["first", "retry"]
     reservations = gr._events(conn, task_id, "governance_delivery_reserved")
     assert [event.payload["attempt"] for event in reservations] == [1, 2]
-    assert len(gr._events(conn, task_id, "governance_delivery_reconciliation_required")) == 1
+    assert (
+        gr._events(conn, task_id, "governance_delivery_reconciliation_required") == []
+    )
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "done"
 
 
-def test_interrupted_delivery_is_never_automatically_resent(conn, git_workspace) -> None:
+def test_interrupted_delivery_is_never_automatically_resent(
+    conn, git_workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     workspace, head, branch = git_workspace
     task_id = kb.create_task(conn, title="candidate", assignee="worker")
     assert kb.claim_task(conn, task_id)
     spec = make_spec(task_id, workspace, head, branch)
     pass_preflight(conn, spec)
     sends: list[str] = []
+    now = [1_000]
+    monkeypatch.setattr(gr.time, "time", lambda: now[0])
 
     class SimulatedInterruption(BaseException):
         pass
@@ -560,6 +592,7 @@ def test_interrupted_delivery_is_never_automatically_resent(conn, git_workspace)
             sender=interrupted_sender,
         )
 
+    # The unexpired owner is reported in-flight: no send, pause, or barrier.
     assert not complete_ready(
         conn,
         spec,
@@ -567,11 +600,55 @@ def test_interrupted_delivery_is_never_automatically_resent(conn, git_workspace)
         product_work=lambda: {"must": "not rerun"},
         sender=interrupted_sender,
     )
+    assert (
+        gr._events(conn, task_id, "governance_delivery_reconciliation_required") == []
+    )
+    assert gr._events(conn, task_id, "governance_scheduler_pause_reserved") == []
+
+    now[0] += gr.DELIVERY_RESERVATION_LEASE_SECONDS + 1
+    pauses: list[str] = []
+    assert not complete_ready(
+        conn,
+        spec,
+        summary="done",
+        product_work=lambda: {"must": "not rerun"},
+        sender=interrupted_sender,
+        pause_scheduler=pauses.append,
+    )
     assert len(sends) == 1
     assert len(gr._events(conn, task_id, "governance_delivery_reserved")) == 1
     assert gr._events(conn, task_id, "governance_delivery_failed") == []
-    assert len(gr._events(conn, task_id, "governance_delivery_reconciliation_required")) == 1
-    assert kb.get_task(conn, task_id).status == "blocked"
+    assert (
+        len(gr._events(conn, task_id, "governance_delivery_reconciliation_required"))
+        == 1
+    )
+    assert len(pauses) == 1
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "blocked"
+
+    dedupe = gr._dedupe_key(spec, gr._sha256(spec.prompt))
+    ok, detail = gr.reconcile_delivery_attempt(
+        conn,
+        task_id,
+        dedupe=dedupe,
+        attempt=1,
+        actor="reviewer",
+        actual_outcome="delivered",
+        evidence="verified the remote issue comment marker",
+        target=str(spec.delivery),
+    )
+    assert ok and detail == "delivery reconciled"
+    assert complete_ready(
+        conn,
+        spec,
+        summary="done",
+        product_work=lambda: {"must": "not rerun"},
+        sender=interrupted_sender,
+    )
+    assert len(sends) == 1
+    assert len(gr._events(conn, task_id, "governance_delivery_reconciled")) == 1
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "done"
 
 
 def test_execution_and_delivery_retry_freshly_resolve_profile_and_skills(
@@ -632,15 +709,103 @@ def test_execution_and_delivery_retry_freshly_resolve_profile_and_skills(
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
-        ("rollback_path", ""),
-        ("rollback_path", "TBD"),
-        ("rollback_path", "This text has many words but nothing useful"),
-        ("pause_path", "placeholder"),
-        ("pause_path", "handle the scheduler somehow later"),
+        ("rollback_path", "revert the candidate and verify it"),
+        ("rollback_path", {}),
+        (
+            "rollback_path",
+            {
+                "steps": [
+                    {
+                        "order": 1,
+                        "action": "revert",
+                        "target": "candidate commit",
+                        "max_attempts": 1,
+                    }
+                ],
+                "verification": {"condition": "candidate is absent", "evidence": []},
+            },
+        ),
+        (
+            "pause_path",
+            {
+                "target": "unrelated database records",
+                "steps": [
+                    {
+                        "order": 1,
+                        "action": "pause",
+                        "target": "database records",
+                        "max_attempts": 1,
+                    }
+                ],
+                "verification": {
+                    "condition": "database records look plausible",
+                    "evidence": [
+                        {"method": "status_readback", "expected": "records exist"}
+                    ],
+                },
+            },
+        ),
+        (
+            "pause_path",
+            {
+                "target": "governed-review scheduler",
+                "steps": [
+                    {
+                        "order": 1,
+                        "action": "observe",
+                        "target": "governed-review scheduler",
+                        "max_attempts": 1,
+                    }
+                ],
+                "verification": {
+                    "condition": "scheduler reports paused",
+                    "evidence": [
+                        {
+                            "method": "scheduler_status",
+                            "expected": "scheduler is paused",
+                        }
+                    ],
+                },
+            },
+        ),
+        (
+            "rollback_path",
+            {
+                "target": "candidate commit",
+                "steps": [
+                    {
+                        "order": 1,
+                        "action": "revert",
+                        "target": "do not revert candidate",
+                        "max_attempts": 1,
+                    }
+                ],
+                "verification": {
+                    "condition": "candidate commit is absent",
+                    "evidence": [
+                        {"method": "git_show", "expected": "candidate is absent"}
+                    ],
+                },
+            },
+        ),
+        (
+            "pause_path",
+            {
+                "target": "governed-review scheduler",
+                "steps": [
+                    {
+                        "order": 1,
+                        "action": "pause",
+                        "target": "governed-review scheduler",
+                        "max_attempts": 1,
+                    }
+                ],
+            },
+        ),
     ],
 )
 def test_preflight_rejects_non_concrete_rollback_and_pause_procedures(
-    conn, git_workspace, field_name: str, value: str
+    conn, git_workspace, field_name: str, value
 ) -> None:
     workspace, head, branch = git_workspace
     task_id = kb.create_task(conn, title="candidate", assignee="worker")
@@ -655,7 +820,68 @@ def test_preflight_rejects_non_concrete_rollback_and_pause_procedures(
     )
 
     assert not result.ok
-    assert any("concrete, actionable procedure" in error for error in result.errors)
+    assert any(
+        "structured, bounded operational procedure" in error for error in result.errors
+    )
+
+
+def test_preflight_accepts_valid_bounded_structured_procedures(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    spec = replace(
+        make_spec(task_id, workspace, head, branch),
+        rollback_path={
+            "target": "candidate release commit",
+            "steps": [
+                {
+                    "order": 1,
+                    "action": "revert",
+                    "target": "candidate release commit",
+                    "max_attempts": 1,
+                }
+            ],
+            "verification": {
+                "condition": "candidate release commit has a recorded revert",
+                "evidence": [
+                    {
+                        "method": "git_show",
+                        "expected": "revert names candidate release commit",
+                    }
+                ],
+            },
+        },
+        pause_path={
+            "target": "governed-review scheduler job",
+            "steps": [
+                {
+                    "order": 1,
+                    "action": "pause",
+                    "target": "governed-review scheduler job",
+                    "max_attempts": 1,
+                }
+            ],
+            "verification": {
+                "condition": "governed-review scheduler job reports paused",
+                "evidence": [
+                    {
+                        "method": "scheduler_status",
+                        "expected": "scheduler job state is paused",
+                    }
+                ],
+            },
+        },
+    )
+
+    result = gr.preflight_governed_review(
+        conn,
+        spec,
+        profile_resolver=lambda profile: True,
+        skill_resolver=lambda profile, skill: True,
+        delivery_readiness=delivery_ready,
+    )
+    assert result.ok, result.errors
 
 
 def test_delivery_retry_is_idempotent_does_not_rerun_product_and_releases_one_child(
@@ -681,20 +907,28 @@ def test_delivery_retry_is_idempotent_does_not_rerun_product_and_releases_one_ch
             raise RuntimeError("simulated GitHub outage")
 
     assert not complete_ready(
-        conn, spec, summary="candidate complete", product_work=product_work, sender=flaky_sender
+        conn,
+        spec,
+        summary="candidate complete",
+        product_work=product_work,
+        sender=flaky_sender,
     )
-    assert kb.get_task(conn, parent).status == "blocked"
+    assert require_task(conn, parent).status == "blocked"
     assert len(product_calls) == 1
 
     assert complete_ready(
-        conn, spec, summary="candidate complete", product_work=product_work, sender=flaky_sender
+        conn,
+        spec,
+        summary="candidate complete",
+        product_work=product_work,
+        sender=flaky_sender,
     )
-    assert kb.get_task(conn, parent).status == "done"
+    assert require_task(conn, parent).status == "done"
     assert len(product_calls) == 1
     assert len(delivery_calls) == 2
     assert delivery_calls[0] == delivery_calls[1]
-    assert kb.get_task(conn, child_a).status == "blocked"
-    assert kb.get_task(conn, child_b).status == "blocked"
+    assert require_task(conn, child_a).status == "blocked"
+    assert require_task(conn, child_b).status == "blocked"
     assert len(gr._events(conn, parent, "governance_child_held")) == 2
     for _ in range(3):
         assert kb.recompute_ready(conn) == 0
@@ -708,20 +942,26 @@ def test_delivery_retry_is_idempotent_does_not_rerun_product_and_releases_one_ch
     assert kb.block_task(conn, child_b, reason="manual hold")
     ok, error = gr.release_one_child(conn, parent, child_a, actor="reviewer")
     assert ok and error is None
-    assert kb.get_task(conn, child_a).status == "ready"
-    assert kb.get_task(conn, child_b).status == "blocked"
+    assert require_task(conn, child_a).status == "ready"
+    assert require_task(conn, child_b).status == "blocked"
     assert kb.recompute_ready(conn) == 0
-    assert kb.get_task(conn, child_b).status == "blocked"
+    assert require_task(conn, child_b).status == "blocked"
 
     # Re-entry after success is idempotent: neither product nor delivery reruns.
     assert complete_ready(
-        conn, spec, summary="candidate complete", product_work=product_work, sender=flaky_sender
+        conn,
+        spec,
+        summary="candidate complete",
+        product_work=product_work,
+        sender=flaky_sender,
     )
     assert len(product_calls) == 1
     assert len(delivery_calls) == 2
 
 
-def test_delivery_exhaustion_blocks_and_pauses_without_third_send(conn, git_workspace) -> None:
+def test_delivery_exhaustion_preserves_distinct_truthful_pause_outcomes(
+    conn, git_workspace
+) -> None:
     workspace, head, branch = git_workspace
     task_id = kb.create_task(conn, title="candidate", assignee="worker")
     assert kb.claim_task(conn, task_id)
@@ -729,7 +969,8 @@ def test_delivery_exhaustion_blocks_and_pauses_without_third_send(conn, git_work
     pass_preflight(conn, spec)
     product_calls: list[int] = []
     sends: list[int] = []
-    pauses: list[str] = []
+    successful_pauses: list[str] = []
+    failed_pause_calls: list[str] = []
 
     def product_work():
         product_calls.append(1)
@@ -739,26 +980,27 @@ def test_delivery_exhaustion_blocks_and_pauses_without_third_send(conn, git_work
         sends.append(1)
         raise RuntimeError("offline")
 
+    def failing_pause(reason: str) -> None:
+        failed_pause_calls.append(reason)
+        raise RuntimeError("pause executor offline")
+
     assert not complete_ready(
         conn,
         spec,
         summary="done",
         product_work=product_work,
         sender=failing_sender,
-        pause_scheduler=pauses.append,
+        pause_scheduler=successful_pauses.append,
     )
-    assert len(pauses) == 1
-    # Delivery-only retry is allowed from the preserved blocked state.
     assert not complete_ready(
         conn,
         spec,
         summary="done",
         product_work=product_work,
         sender=failing_sender,
-        pause_scheduler=pauses.append,
+        pause_scheduler=failing_pause,
     )
-    assert len(pauses) == 2
-    # Exhaustion is also paused once and repeated checks are idempotent.
+    # Exhaustion has no executor. Re-entry is idempotent and never creates attempt 3.
     for _ in range(2):
         assert not complete_ready(
             conn,
@@ -766,17 +1008,29 @@ def test_delivery_exhaustion_blocks_and_pauses_without_third_send(conn, git_work
             summary="done",
             product_work=product_work,
             sender=failing_sender,
-            pause_scheduler=pauses.append,
         )
+
     assert len(product_calls) == 1
     assert len(sends) == 2
-    assert len(pauses) == 3
+    assert len(successful_pauses) == 1
+    assert len(failed_pause_calls) == 1
     assert len(gr._events(conn, task_id, "governance_delivery_failed")) == 2
-    assert len(gr._events(conn, task_id, "governance_scheduler_paused")) == 3
-    assert kb.get_task(conn, task_id).status == "blocked"
+    assert len(gr._events(conn, task_id, "governance_delivery_reserved")) == 2
+    assert len(gr._events(conn, task_id, "governance_scheduler_paused")) == 1
+    assert len(gr._events(conn, task_id, "governance_scheduler_pause_failed")) == 1
+    assert len(gr._events(conn, task_id, "governance_scheduler_pause_unavailable")) == 1
+    reservations = gr._events(conn, task_id, "governance_scheduler_pause_reserved")
+    blocker_keys = {(event.payload or {})["blocker_key"] for event in reservations}
+    assert len(blocker_keys) == 3
+    assert any(key.startswith("delivery-failed:") for key in blocker_keys)
+    assert any(key.startswith("delivery-exhausted:") for key in blocker_keys)
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "blocked"
 
 
-def test_exhaustion_allows_one_preserved_state_recovery_and_rejects_second(conn) -> None:
+def test_exhaustion_allows_one_preserved_state_recovery_and_rejects_second(
+    conn,
+) -> None:
     task_id = kb.create_task(conn, title="candidate", assignee="worker")
     conn.execute(
         "UPDATE tasks SET status='blocked', consecutive_failures=2, last_failure_error='turns exhausted' "
@@ -793,7 +1047,7 @@ def test_exhaustion_allows_one_preserved_state_recovery_and_rejects_second(conn)
         conn, task_id, actor="B1-DO", reason="authorized recovery"
     )
     assert ok, detail
-    assert kb.get_task(conn, task_id).status == "ready"
+    assert require_task(conn, task_id).status == "ready"
     recovery = gr._events(conn, task_id, "governance_preserved_recovery")
     assert len(recovery) == 1
     assert recovery[0].payload["prior_consecutive_failures"] == 2
@@ -811,7 +1065,7 @@ def test_exhaustion_allows_one_preserved_state_recovery_and_rejects_second(conn)
     )
     assert not ok
     assert "already used" in detail
-    assert kb.get_task(conn, task_id).status == "blocked"
+    assert require_task(conn, task_id).status == "blocked"
     assert len(pauses) == 1
 
 
@@ -826,7 +1080,15 @@ def test_exhaustion_allows_one_preserved_state_recovery_and_rejects_second(conn)
         "governance-preflight: invalid state",
         "delivery-failed: offline",
     ],
-    ids=["manual", "review-required", "doctrine", "security", "policy", "preflight", "delivery"],
+    ids=[
+        "manual",
+        "review-required",
+        "doctrine",
+        "security",
+        "policy",
+        "preflight",
+        "delivery",
+    ],
 )
 def test_preserved_recovery_refuses_substantive_holds_even_with_historical_exhaustion(
     conn, hold_reason: str
@@ -846,7 +1108,7 @@ def test_preserved_recovery_refuses_substantive_holds_even_with_historical_exhau
 
     assert not ok
     assert "substantive hold" in detail
-    assert kb.get_task(conn, task_id).status == "blocked"
+    assert require_task(conn, task_id).status == "blocked"
     assert gr._events(conn, task_id, "governance_preserved_recovery") == []
 
 
@@ -861,10 +1123,12 @@ def test_preserved_recovery_requires_durable_operational_failure_evidence(conn) 
 
     assert not ok
     assert "durable operational failure" in detail
-    assert kb.get_task(conn, task_id).status == "blocked"
+    assert require_task(conn, task_id).status == "blocked"
 
 
-def test_preserved_recovery_requires_failure_evidence_matching_current_breaker(conn) -> None:
+def test_preserved_recovery_requires_failure_evidence_matching_current_breaker(
+    conn,
+) -> None:
     task_id = kb.create_task(conn, title="candidate", assignee="worker")
     conn.execute(
         "UPDATE tasks SET status='blocked', consecutive_failures=2, "
@@ -889,21 +1153,29 @@ def test_preserved_recovery_requires_failure_evidence_matching_current_breaker(c
     assert task.status == "blocked"
 
 
-def test_complete_task_default_release_is_unchanged_and_opt_out_is_explicit(conn) -> None:
+def test_complete_task_default_release_is_unchanged_and_opt_out_is_explicit(
+    conn,
+) -> None:
     parent_default = kb.create_task(conn, title="default parent")
-    child_default = kb.create_task(conn, title="default child", parents=[parent_default])
+    child_default = kb.create_task(
+        conn, title="default child", parents=[parent_default]
+    )
     assert kb.complete_task(conn, parent_default, summary="done")
-    assert kb.get_task(conn, child_default).status == "ready"
+    assert require_task(conn, child_default).status == "ready"
 
     parent_governed = kb.create_task(conn, title="governed parent")
-    child_governed = kb.create_task(conn, title="governed child", parents=[parent_governed])
+    child_governed = kb.create_task(
+        conn, title="governed child", parents=[parent_governed]
+    )
     assert kb.complete_task(
         conn, parent_governed, summary="done", recompute_dependents=False
     )
-    assert kb.get_task(conn, child_governed).status == "todo"
+    assert require_task(conn, child_governed).status == "todo"
 
 
-def test_product_failure_blocks_and_pauses_without_delivery(conn, git_workspace) -> None:
+def test_product_failure_blocks_and_pauses_without_delivery(
+    conn, git_workspace
+) -> None:
     workspace, head, branch = git_workspace
     task_id = kb.create_task(conn, title="candidate", assignee="worker")
     assert kb.claim_task(conn, task_id)
@@ -929,6 +1201,311 @@ def test_product_failure_blocks_and_pauses_without_delivery(conn, git_workspace)
     assert not sends
     assert len(pauses) == 1
     assert len(gr._events(conn, task_id, "governance_product_failed")) == 1
+
+
+def test_scheduler_pause_interruption_requires_reconciliation(
+    conn, monkeypatch
+) -> None:
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    now = [4_000]
+    monkeypatch.setattr(gr.time, "time", lambda: now[0])
+
+    class SimulatedInterruption(BaseException):
+        pass
+
+    def interrupted_pause(reason: str) -> None:
+        raise SimulatedInterruption(reason)
+
+    with pytest.raises(SimulatedInterruption):
+        gr._pause_once(
+            conn,
+            task_id,
+            "pause-interruption",
+            "interrupted pause",
+            interrupted_pause,
+        )
+    assert (
+        gr._pause_once(
+            conn,
+            task_id,
+            "pause-interruption",
+            "must not execute concurrently",
+            pytest.fail,
+        )
+        == "in_flight"
+    )
+
+    now[0] += gr.PAUSE_RESERVATION_LEASE_SECONDS + 1
+    assert (
+        gr._pause_once(
+            conn,
+            task_id,
+            "pause-interruption",
+            "pause outcome unknown",
+            pytest.fail,
+        )
+        == "reconciliation_required"
+    )
+    gr._sticky_block_once(conn, task_id, "pause outcome unknown")
+    ok, error = gr.reconcile_scheduler_pause(
+        conn,
+        task_id,
+        blocker_key="pause-interruption",
+        actor="reviewer",
+        actual_outcome="paused",
+        evidence="OPS-7",
+    )
+    assert ok and error == "scheduler pause reconciled"
+    assert len(gr._events(conn, task_id, "governance_scheduler_paused")) == 1
+
+
+def test_release_one_child_cas_rejects_replaced_hold_relation(
+    conn, monkeypatch
+) -> None:
+    parent = kb.create_task(conn, title="parent", assignee="worker")
+    child = kb.create_task(
+        conn,
+        title="child",
+        assignee="worker",
+        parents=[parent],
+    )
+    assert kb.complete_task(conn, parent, recompute_dependents=False)
+    gr._hold_governed_children(conn, parent)
+    original_events = gr._events
+    injected = False
+
+    def events_with_replacement(connection, task_id, kind=None):
+        nonlocal injected
+        events = original_events(connection, task_id, kind)
+        if task_id == child and kind is None and not injected:
+            injected = True
+            kb._append_event(
+                connection,
+                child,
+                "blocked",
+                {"reason": "manual replacement hold"},
+            )
+        return events
+
+    monkeypatch.setattr(gr, "_events", events_with_replacement)
+    ok, error = gr.release_one_child(
+        conn,
+        parent,
+        child,
+        actor="reviewer",
+    )
+    assert not ok
+    assert error == f"child {child} hold changed during governed release"
+    task = kb.get_task(conn, child)
+    assert task is not None and task.status == "blocked"
+    assert not gr._events(conn, parent, "governance_child_released")
+
+
+def test_stale_delivery_owner_cannot_record_after_replacement(
+    conn, git_workspace, monkeypatch
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    spec = make_spec(task_id, workspace, head, branch)
+    dedupe_key = gr._dedupe_key(spec, gr._sha256(spec.prompt))
+    now = [5_000]
+    monkeypatch.setattr(gr.time, "time", lambda: now[0])
+
+    state, attempt, old_owner = gr._reserve_delivery_attempt(conn, task_id, dedupe_key)
+    assert state == "owner" and attempt == 1 and old_owner
+    now[0] += gr.DELIVERY_RESERVATION_LEASE_SECONDS + 1
+    state, blocked_attempt, new_owner = gr._reserve_delivery_attempt(
+        conn, task_id, dedupe_key
+    )
+    assert state == "reconciliation"
+    assert blocked_attempt == 1 and new_owner is None
+    assert not gr._record_delivery_outcome(
+        conn,
+        task_id,
+        dedupe=dedupe_key,
+        attempt=1,
+        reservation_id=old_owner,
+        kind="governance_delivery_succeeded",
+        payload={"target": str(spec.delivery)},
+    )
+    reconciliations = gr._events(
+        conn,
+        task_id,
+        "governance_delivery_reconciliation_required",
+    )
+    assert len(reconciliations) == 1
+    assert (reconciliations[0].payload or {})["reservation_id"] == old_owner
+
+
+def test_interrupted_product_lease_requires_manual_reconciliation(
+    conn, git_workspace, monkeypatch
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    assert kb.claim_task(conn, task_id)
+    spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
+    now = [6_000]
+    monkeypatch.setattr(gr.time, "time", lambda: now[0])
+    product_calls: list[str] = []
+    sends: list[str] = []
+
+    class SimulatedInterruption(BaseException):
+        pass
+
+    def interrupted_product():
+        product_calls.append("interrupted")
+        raise SimulatedInterruption("worker terminated")
+
+    with pytest.raises(SimulatedInterruption):
+        complete_ready(
+            conn,
+            spec,
+            summary="done",
+            product_work=interrupted_product,
+            sender=lambda target, body: sends.append(body),
+        )
+    assert not complete_ready(
+        conn,
+        spec,
+        summary="done",
+        product_work=lambda: product_calls.append("unexpected"),
+        sender=lambda target, body: sends.append(body),
+    )
+    assert product_calls == ["interrupted"]
+
+    now[0] += gr.PRODUCT_RESERVATION_LEASE_SECONDS + 1
+    assert not complete_ready(
+        conn,
+        spec,
+        summary="done",
+        product_work=lambda: product_calls.append("unexpected"),
+        sender=lambda target, body: sends.append(body),
+    )
+    assert product_calls == ["interrupted"]
+    assert (
+        len(gr._events(conn, task_id, "governance_product_reconciliation_required"))
+        == 1
+    )
+
+    ok, error = gr.reconcile_product_execution(
+        conn,
+        task_id,
+        dedupe=gr._dedupe_key(spec, gr._sha256(spec.prompt)),
+        actor="reviewer",
+        actual_outcome="completed",
+        evidence={"tests": "verified externally"},
+    )
+    assert ok and error == "product reconciled"
+    assert complete_ready(
+        conn,
+        spec,
+        summary="done",
+        product_work=lambda: product_calls.append("unexpected"),
+        sender=lambda target, body: sends.append(body),
+    )
+    assert product_calls == ["interrupted"]
+    assert len(sends) == 1
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "done"
+
+
+def test_preserved_state_recovery_rolls_back_on_interruption(conn, monkeypatch) -> None:
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    conn.execute(
+        "UPDATE tasks SET status='blocked', consecutive_failures=2, "
+        "last_failure_error='turns exhausted' WHERE id=?",
+        (task_id,),
+    )
+    conn.execute(
+        "INSERT INTO task_events(task_id, kind, payload, created_at) "
+        "VALUES (?, 'gave_up', ?, 1)",
+        (task_id, '{"error":"turns exhausted"}'),
+    )
+    conn.commit()
+    original_append = kb._append_event
+
+    class SimulatedInterruption(BaseException):
+        pass
+
+    def interrupting_append(connection, event_task_id, kind, payload):
+        if kind == "promoted_manual":
+            raise SimulatedInterruption("worker terminated during recovery")
+        return original_append(connection, event_task_id, kind, payload)
+
+    monkeypatch.setattr(kb, "_append_event", interrupting_append)
+    with pytest.raises(SimulatedInterruption):
+        gr.request_preserved_state_recovery(
+            conn,
+            task_id,
+            actor="reviewer",
+            reason="one bounded retry",
+        )
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "blocked"
+    assert not gr._events(conn, task_id, "governance_preserved_recovery")
+
+    monkeypatch.setattr(kb, "_append_event", original_append)
+    ok, detail = gr.request_preserved_state_recovery(
+        conn,
+        task_id,
+        actor="reviewer",
+        reason="one bounded retry",
+    )
+    assert ok and detail == "recovery released"
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "ready"
+    assert len(gr._events(conn, task_id, "governance_preserved_recovery")) == 1
+
+
+def test_preserved_state_recovery_is_atomic_under_concurrency(conn) -> None:
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    conn.execute(
+        "UPDATE tasks SET status='blocked', consecutive_failures=2, "
+        "last_failure_error='turns exhausted' WHERE id=?",
+        (task_id,),
+    )
+    conn.execute(
+        "INSERT INTO task_events(task_id, kind, payload, created_at) "
+        "VALUES (?, 'gave_up', ?, 1)",
+        (task_id, '{"error":"turns exhausted"}'),
+    )
+    conn.commit()
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    barrier = threading.Barrier(2)
+    results: list[tuple[bool, str]] = []
+    errors: list[BaseException] = []
+
+    def recover() -> None:
+        local = kb.connect(db_path)
+        try:
+            barrier.wait()
+            results.append(
+                gr.request_preserved_state_recovery(
+                    local,
+                    task_id,
+                    actor="reviewer",
+                    reason="one bounded retry",
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            local.close()
+
+    threads = [threading.Thread(target=recover) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not errors
+    assert sorted(ok for ok, _ in results) == [False, True]
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "ready"
+    assert len(gr._events(conn, task_id, "governance_preserved_recovery")) == 1
+    assert len(gr._events(conn, task_id, "governance_scheduler_paused")) == 0
+    assert len(gr._events(conn, task_id, "governance_scheduler_pause_unavailable")) == 1
 
 
 @pytest.mark.parametrize(
@@ -969,7 +1546,9 @@ def test_default_readiness_proves_sufficient_comment_permission_without_probe_co
                 }
             }
         }
-        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+        return subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(payload), stderr=""
+        )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     ready, detail = gr._default_delivery_readiness(target)
