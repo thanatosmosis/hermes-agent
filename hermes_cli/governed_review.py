@@ -12,6 +12,7 @@ import json
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -231,6 +232,24 @@ def _append(conn, task_id: str, kind: str, payload: dict[str, Any]) -> None:
         kb._append_event(conn, task_id, kind, payload)  # package-internal audit path
 
 
+def _append_once(
+    conn,
+    task_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    identity_keys: tuple[str, ...],
+) -> bool:
+    """Atomically append one event for the selected payload identity."""
+    with kb.write_txn(conn):
+        for event in _events(conn, task_id, kind):
+            prior = event.payload or {}
+            if all(prior.get(key) == payload.get(key) for key in identity_keys):
+                return False
+        kb._append_event(conn, task_id, kind, payload)
+    return True
+
+
 def _pause_once(
     conn,
     task_id: str,
@@ -238,19 +257,56 @@ def _pause_once(
     reason: str,
     pause_scheduler: Optional[PauseCallback],
 ) -> None:
-    prior = [
-        event for event in _events(conn, task_id, "governance_scheduler_paused")
-        if (event.payload or {}).get("blocker_key") == blocker_key
-    ]
-    if prior:
+    reservation_id = uuid.uuid4().hex
+    with kb.write_txn(conn):
+        prior = [
+            event
+            for event in _events(conn, task_id)
+            if event.kind in (
+                "governance_scheduler_pause_reserved",
+                "governance_scheduler_paused",
+                "governance_scheduler_pause_failed",
+            )
+            and (event.payload or {}).get("blocker_key") == blocker_key
+        ]
+        if prior:
+            return
+        kb._append_event(
+            conn,
+            task_id,
+            "governance_scheduler_pause_reserved",
+            {
+                "blocker_key": blocker_key,
+                "reason": reason,
+                "reservation_id": reservation_id,
+            },
+        )
+
+    try:
+        if pause_scheduler is not None:
+            pause_scheduler(reason)
+    except Exception as exc:
+        _append(
+            conn,
+            task_id,
+            "governance_scheduler_pause_failed",
+            {
+                "blocker_key": blocker_key,
+                "reason": reason,
+                "reservation_id": reservation_id,
+                "error": str(exc)[:500],
+            },
+        )
         return
-    if pause_scheduler is not None:
-        pause_scheduler(reason)
     _append(
         conn,
         task_id,
         "governance_scheduler_paused",
-        {"blocker_key": blocker_key, "reason": reason},
+        {
+            "blocker_key": blocker_key,
+            "reason": reason,
+            "reservation_id": reservation_id,
+        },
     )
 
 
@@ -284,6 +340,44 @@ def _dedupe_key(spec: GovernedReviewSpec, prompt_hash: str) -> str:
     return f"governed-review:{_sha256(material)}"
 
 
+def _validate_procedure(label: str, value: str) -> Optional[str]:
+    text = str(value or "").strip()
+    normalized = " ".join(text.casefold().split()).strip(" .;:-_")
+    placeholders = {
+        "n/a",
+        "na",
+        "none",
+        "not applicable",
+        "placeholder",
+        "tbd",
+        "todo",
+        "to do",
+        "unknown",
+        "later",
+    }
+    action_words = {
+        "block",
+        "disable",
+        "keep",
+        "pause",
+        "preserve",
+        "restore",
+        "revert",
+        "roll back",
+        "rollback",
+        "stop",
+    }
+    if (
+        not text
+        or normalized in placeholders
+        or len(text) < 20
+        or len(text.split()) < 4
+        or not any(action in normalized for action in action_words)
+    ):
+        return f"{label} procedure must be a concrete, actionable procedure"
+    return None
+
+
 def _preflight_identity(
     spec: GovernedReviewSpec,
     prompt_hash: str,
@@ -297,6 +391,8 @@ def _preflight_identity(
         "delivery_target": f"{spec.delivery.repository}#{spec.delivery.issue}",
         "prompt_hash": prompt_hash,
         "dedupe_key": dedupe,
+        "rollback_path": spec.rollback_path,
+        "pause_path": spec.pause_path,
     }
 
 
@@ -351,18 +447,39 @@ def preflight_governed_review(
             dedupe,
         )
 
+    rollback_error = _validate_procedure("rollback", spec.rollback_path)
+    pause_error = _validate_procedure("pause", spec.pause_path)
+    if rollback_error:
+        errors.append(rollback_error)
+    if pause_error:
+        errors.append(pause_error)
+
     evidence["actual_profile"] = task.assignee
     evidence["requested_skills"] = list(task.skills or [])
-    missing: list[str] = []
-    if not task.assignee or not profile_resolver(task.assignee):
+    try:
+        profile_ready = bool(task.assignee and profile_resolver(task.assignee))
+    except Exception as exc:
+        profile_ready = False
+        errors.append(f"actual assignee profile resolution failed: {exc}")
+    if not profile_ready and not any(
+        "profile resolution failed" in error for error in errors
+    ):
         errors.append(f"actual assignee profile does not exist: {task.assignee!r}")
-    else:
-        missing = [
-            skill for skill in (task.skills or [])
-            if not skill_resolver(task.assignee, skill)
-        ]
-    if missing:
-        errors.append(f"requested skills do not resolve for {task.assignee}: {', '.join(missing)}")
+    if profile_ready:
+        assert task.assignee is not None
+        missing: list[str] = []
+        for skill in task.skills or []:
+            try:
+                resolved = skill_resolver(task.assignee, skill)
+            except Exception:
+                resolved = False
+            if not resolved:
+                missing.append(skill)
+        if missing:
+            errors.append(
+                f"requested skills do not resolve for {task.assignee}: "
+                f"{', '.join(missing)}"
+            )
 
     parent_rows = conn.execute(
         "SELECT p.id, p.status FROM tasks p JOIN task_links l ON l.parent_id=p.id "
@@ -423,6 +540,12 @@ def preflight_governed_review(
     gate_events = _governance_gate_events(conn, spec.task_id)
     latest_gate = gate_events[-1] if gate_events else None
     identity = _preflight_identity(spec, prompt_hash, dedupe)
+    identity.update(
+        {
+            "actual_profile": task.assignee,
+            "requested_skills": list(task.skills or []),
+        }
+    )
     if result.ok:
         if (
             latest_gate is None
@@ -432,7 +555,10 @@ def preflight_governed_review(
             _append(conn, spec.task_id, "governance_preflight_passed", evidence)
         return result
 
-    blocker_key = f"preflight:{dedupe}"
+    blocker_material = json.dumps(
+        {"identity": identity, "errors": errors}, sort_keys=True, default=str
+    )
+    blocker_key = f"preflight:{dedupe}:{_sha256(blocker_material)}"
     if (
         latest_gate is None
         or latest_gate.kind != "governance_preflight_blocked"
@@ -459,12 +585,19 @@ def hold_for_review(conn, task_id: str, reason: str) -> bool:
 
 
 def release_one_child(conn, parent_id: str, child_id: str, *, actor: str) -> tuple[bool, Optional[str]]:
-    """Release exactly one linked child after all of its parents are terminal."""
+    """Release exactly one child whose active hold belongs to this parent."""
     if child_id not in kb.child_ids(conn, parent_id):
         return False, f"{child_id} is not a child of {parent_id}"
     parent = kb.get_task(conn, parent_id)
     if parent is None or parent.status not in ("done", "archived"):
         return False, f"parent {parent_id} is not terminal"
+    child = kb.get_task(conn, child_id)
+    if child is None:
+        return False, f"child {child_id} does not exist"
+    hold_reason = f"governance-child-hold:{parent_id}"
+    active_reason = _active_block_reason(_events(conn, child_id))
+    if child.status != "blocked" or active_reason != hold_reason:
+        return False, f"child {child_id} is not held for governed release from {parent_id}"
     ok, error = kb.promote_task(
         conn,
         child_id,
@@ -472,6 +605,15 @@ def release_one_child(conn, parent_id: str, child_id: str, *, actor: str) -> tup
         reason=f"explicit governed release from {parent_id}",
     )
     if ok:
+        _append(
+            conn,
+            child_id,
+            "unblocked",
+            {
+                "status": "ready",
+                "reason": f"explicit governed release from {parent_id}",
+            },
+        )
         _append(
             conn,
             parent_id,
@@ -497,23 +639,62 @@ def _execution_gate_errors(
     dedupe: str,
     product_already_completed: bool,
     delivery_readiness: ReadinessProbe,
+    profile_resolver: ProfileResolver,
+    skill_resolver: SkillResolver,
 ) -> list[str]:
     errors: list[str] = []
+
+    try:
+        profile_ready = bool(task.assignee and profile_resolver(task.assignee))
+    except Exception as exc:
+        profile_ready = False
+        errors.append(f"actual assignee profile resolution failed: {exc}")
+    if not profile_ready and not any("profile resolution failed" in error for error in errors):
+        errors.append(f"actual assignee profile does not exist: {task.assignee!r}")
+    if profile_ready:
+        missing_skills: list[str] = []
+        for skill in task.skills or []:
+            try:
+                resolved = skill_resolver(task.assignee, skill)
+            except Exception:
+                resolved = False
+            if not resolved:
+                missing_skills.append(skill)
+        if missing_skills:
+            errors.append(
+                f"requested skills do not resolve for {task.assignee}: "
+                f"{', '.join(missing_skills)}"
+            )
+
+    for label, value in (("rollback", spec.rollback_path), ("pause", spec.pause_path)):
+        procedure_error = _validate_procedure(label, value)
+        if procedure_error:
+            errors.append(procedure_error)
+
     identity = _preflight_identity(spec, prompt_hash, dedupe)
+    identity.update(
+        {
+            "actual_profile": task.assignee,
+            "requested_skills": list(task.skills or []),
+        }
+    )
     gate_events = _governance_gate_events(conn, spec.task_id)
     latest_gate = gate_events[-1] if gate_events else None
-    if (
-        latest_gate is None
-        or latest_gate.kind != "governance_preflight_passed"
-        or not _payload_matches_identity(latest_gate.payload, identity)
-    ):
-        return ["no current matching successful governance preflight"]
-
-    preflight_payload = latest_gate.payload or {}
-    if preflight_payload.get("actual_profile") != task.assignee:
-        errors.append("task assignee changed after governance preflight")
-    if preflight_payload.get("requested_skills") != list(task.skills or []):
-        errors.append("task skills changed after governance preflight")
+    matching_preflight = bool(
+        latest_gate is not None
+        and latest_gate.kind == "governance_preflight_passed"
+        and _payload_matches_identity(latest_gate.payload, identity)
+    )
+    if not matching_preflight:
+        errors.append("no current matching successful governance preflight")
+        preflight_payload: dict[str, Any] = {}
+    else:
+        assert latest_gate is not None
+        preflight_payload = latest_gate.payload or {}
+        if preflight_payload.get("actual_profile") != task.assignee:
+            errors.append("task assignee changed after governance preflight")
+        if preflight_payload.get("requested_skills") != list(task.skills or []):
+            errors.append("task skills changed after governance preflight")
     parent_rows = conn.execute(
         "SELECT p.id, p.status FROM tasks p JOIN task_links l ON l.parent_id=p.id "
         "WHERE l.child_id=? ORDER BY p.id",
@@ -641,6 +822,185 @@ def _record_execution_block(
     _pause_once(conn, spec.task_id, blocker_key, "; ".join(errors), pause_scheduler)
 
 
+def _reserve_product_execution(conn, task_id: str, dedupe: str) -> tuple[str, Optional[str]]:
+    """Atomically reserve the sole product callback owner for a dedupe key."""
+    reservation_id = uuid.uuid4().hex
+    with kb.write_txn(conn):
+        matching = [
+            event
+            for event in _events(conn, task_id)
+            if (event.payload or {}).get("dedupe_key") == dedupe
+        ]
+        if any(event.kind == "governance_product_completed" for event in matching):
+            return "completed", None
+        if any(event.kind == "governance_product_failed" for event in matching):
+            return "failed", None
+        if any(event.kind == "governance_product_reserved" for event in matching):
+            return "reserved", None
+        kb._append_event(
+            conn,
+            task_id,
+            "governance_product_reserved",
+            {
+                "dedupe_key": dedupe,
+                "reservation_id": reservation_id,
+                "reserved_at": int(time.time()),
+            },
+        )
+    return "owner", reservation_id
+
+
+def _reserve_delivery_attempt(
+    conn,
+    task_id: str,
+    dedupe: str,
+) -> tuple[str, Optional[int], Optional[str]]:
+    """Atomically reserve one sender attempt or identify a fail-closed state."""
+    reservation_id = uuid.uuid4().hex
+    with kb.write_txn(conn):
+        matching = [
+            event
+            for event in _events(conn, task_id)
+            if (event.payload or {}).get("dedupe_key") == dedupe
+            and event.kind in (
+                "governance_delivery_reserved",
+                "governance_delivery_failed",
+                "governance_delivery_succeeded",
+            )
+        ]
+        if any(event.kind == "governance_delivery_succeeded" for event in matching):
+            return "succeeded", None, None
+
+        reservations: set[int] = set()
+        outcomes: set[int] = set()
+        for event in matching:
+            raw_attempt = (event.payload or {}).get("attempt")
+            if raw_attempt is None:
+                continue
+            try:
+                attempt = int(raw_attempt)
+            except (TypeError, ValueError):
+                continue
+            if event.kind == "governance_delivery_reserved":
+                reservations.add(attempt)
+            else:
+                outcomes.add(attempt)
+
+        unknown = sorted(reservations - outcomes)
+        if unknown:
+            return "unknown", unknown[0], None
+
+        used_attempts = reservations | outcomes
+        attempt = max(used_attempts, default=0) + 1
+        if attempt > MAX_DELIVERY_ATTEMPTS:
+            return "exhausted", None, None
+
+        kb._append_event(
+            conn,
+            task_id,
+            "governance_delivery_reserved",
+            {
+                "dedupe_key": dedupe,
+                "attempt": attempt,
+                "reservation_id": reservation_id,
+                "reserved_at": int(time.time()),
+            },
+        )
+    return "owner", attempt, reservation_id
+
+
+def _hold_governed_children(conn, parent_id: str) -> list[str]:
+    """Durably hold every linked child before governed parent completion."""
+    errors: list[str] = []
+    hold_reason = f"governance-child-hold:{parent_id}"
+    with kb.write_txn(conn):
+        children = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.child_id=t.id "
+            "WHERE l.parent_id=? ORDER BY t.id",
+            (parent_id,),
+        ).fetchall()
+        parent_events = _events(conn, parent_id, "governance_child_held")
+        recorded = {
+            (event.payload or {}).get("child_id")
+            for event in parent_events
+        }
+        for child in children:
+            child_id = child["id"]
+            status = child["status"]
+            preexisting_reason = _active_block_reason(_events(conn, child_id))
+            if status in ("todo", "ready"):
+                cur = conn.execute(
+                    "UPDATE tasks SET status='blocked' "
+                    "WHERE id=? AND status=?",
+                    (child_id, status),
+                )
+                if cur.rowcount != 1:
+                    errors.append(f"child {child_id} changed while applying governed hold")
+                    continue
+                kb._append_event(conn, child_id, "blocked", {"reason": hold_reason})
+                effective_reason = hold_reason
+            elif status == "blocked":
+                if preexisting_reason:
+                    effective_reason = preexisting_reason
+                else:
+                    kb._append_event(conn, child_id, "blocked", {"reason": hold_reason})
+                    effective_reason = hold_reason
+            else:
+                errors.append(
+                    f"child {child_id} status {status!r} cannot be durably held"
+                )
+                continue
+
+            if child_id not in recorded:
+                kb._append_event(
+                    conn,
+                    parent_id,
+                    "governance_child_held",
+                    {
+                        "child_id": child_id,
+                        "prior_status": status,
+                        "hold_reason": effective_reason,
+                        "governed_release_required": effective_reason == hold_reason,
+                    },
+                )
+    return errors
+
+
+def _record_delivery_reconciliation(
+    conn,
+    spec: GovernedReviewSpec,
+    *,
+    dedupe: str,
+    attempt: int,
+    pause_scheduler: Optional[PauseCallback],
+) -> None:
+    payload = {
+        "dedupe_key": dedupe,
+        "attempt": attempt,
+        "reason": "reserved delivery has no durable outcome; manual reconciliation required",
+    }
+    _append_once(
+        conn,
+        spec.task_id,
+        "governance_delivery_reconciliation_required",
+        payload,
+        identity_keys=("dedupe_key", "attempt"),
+    )
+    _sticky_block_once(
+        conn,
+        spec.task_id,
+        "delivery-unknown: manual reconciliation required",
+    )
+    _pause_once(
+        conn,
+        spec.task_id,
+        f"delivery-unknown:{dedupe}:{attempt}",
+        "delivery outcome is unknown; manual reconciliation required",
+        pause_scheduler,
+    )
+
+
 def complete_with_issue_delivery(
     conn,
     spec: GovernedReviewSpec,
@@ -649,13 +1009,14 @@ def complete_with_issue_delivery(
     product_work: ProductCallback,
     sender: DeliverySender = _default_delivery_sender,
     delivery_readiness: ReadinessProbe = _default_delivery_readiness,
+    profile_resolver: ProfileResolver = _default_profile_resolver,
+    skill_resolver: SkillResolver = _default_skill_resolver,
     pause_scheduler: Optional[PauseCallback] = None,
 ) -> bool:
-    """Persist product evidence, deliver once, then complete without fan-out.
+    """Run product and delivery callbacks only after durable atomic reservations.
 
-    A failed first delivery sticky-blocks completion. A second invocation is a
-    delivery-only retry because the durable product event suppresses rerunning
-    ``product_work``. No more than one retry is allowed.
+    A known failed delivery permits one delivery-only retry. A reserved attempt
+    without a durable success/failure outcome is never retried automatically.
     """
     prompt_hash = _sha256(spec.prompt)
     dedupe = _dedupe_key(spec, prompt_hash)
@@ -664,14 +1025,16 @@ def complete_with_issue_delivery(
         return False
 
     success_events = [
-        event for event in _events(conn, spec.task_id, "governance_delivery_succeeded")
+        event
+        for event in _events(conn, spec.task_id, "governance_delivery_succeeded")
         if (event.payload or {}).get("dedupe_key") == dedupe
     ]
     if task.status == "done":
         return bool(success_events)
 
     product_events = [
-        event for event in _events(conn, spec.task_id, "governance_product_completed")
+        event
+        for event in _events(conn, spec.task_id, "governance_product_completed")
         if (event.payload or {}).get("dedupe_key") == dedupe
     ]
     gate_errors = _execution_gate_errors(
@@ -682,6 +1045,8 @@ def complete_with_issue_delivery(
         task=task,
         product_already_completed=bool(product_events),
         delivery_readiness=delivery_readiness,
+        profile_resolver=profile_resolver,
+        skill_resolver=skill_resolver,
     )
     if gate_errors:
         _record_execution_block(
@@ -695,90 +1060,186 @@ def complete_with_issue_delivery(
         return False
 
     if not product_events:
-        try:
-            evidence = product_work()
-        except Exception as exc:
-            blocker_key = f"product-failed:{dedupe}"
-            _append(
-                conn,
-                spec.task_id,
-                "governance_product_failed",
-                {"dedupe_key": dedupe, "error": str(exc)[:500]},
-            )
-            _sticky_block_once(conn, spec.task_id, f"product-failed: {str(exc)[:300]}")
-            _pause_once(conn, spec.task_id, blocker_key, "product work failed", pause_scheduler)
-            return False
-        if not isinstance(evidence, dict):
-            blocker_key = f"product-evidence-invalid:{dedupe}"
-            _append(
-                conn,
-                spec.task_id,
-                "governance_product_failed",
-                {"dedupe_key": dedupe, "error": "product evidence was not a dict"},
-            )
-            _sticky_block_once(conn, spec.task_id, "product-failed: invalid evidence shape")
-            _pause_once(conn, spec.task_id, blocker_key, "product evidence invalid", pause_scheduler)
-            return False
-        _append(
-            conn,
-            spec.task_id,
-            "governance_product_completed",
-            {
-                "dedupe_key": dedupe,
-                "prompt_hash": prompt_hash,
-                "evidence": evidence,
-                "completed_at": int(time.time()),
-            },
+        product_state, product_reservation_id = _reserve_product_execution(
+            conn, spec.task_id, dedupe
         )
-        product_events = _events(conn, spec.task_id, "governance_product_completed")
+        if product_state == "completed":
+            product_events = [
+                event
+                for event in _events(conn, spec.task_id, "governance_product_completed")
+                if (event.payload or {}).get("dedupe_key") == dedupe
+            ]
+        elif product_state != "owner" or product_reservation_id is None:
+            return False
+        else:
+            try:
+                evidence = product_work()
+            except Exception as exc:
+                blocker_key = f"product-failed:{dedupe}"
+                _append(
+                    conn,
+                    spec.task_id,
+                    "governance_product_failed",
+                    {
+                        "dedupe_key": dedupe,
+                        "reservation_id": product_reservation_id,
+                        "error": str(exc)[:500],
+                    },
+                )
+                _sticky_block_once(
+                    conn, spec.task_id, f"product-failed: {str(exc)[:300]}"
+                )
+                _pause_once(
+                    conn,
+                    spec.task_id,
+                    blocker_key,
+                    "product work failed",
+                    pause_scheduler,
+                )
+                return False
+            if not isinstance(evidence, dict):
+                blocker_key = f"product-evidence-invalid:{dedupe}"
+                _append(
+                    conn,
+                    spec.task_id,
+                    "governance_product_failed",
+                    {
+                        "dedupe_key": dedupe,
+                        "reservation_id": product_reservation_id,
+                        "error": "product evidence was not a dict",
+                    },
+                )
+                _sticky_block_once(
+                    conn, spec.task_id, "product-failed: invalid evidence shape"
+                )
+                _pause_once(
+                    conn,
+                    spec.task_id,
+                    blocker_key,
+                    "product evidence invalid",
+                    pause_scheduler,
+                )
+                return False
+            _append(
+                conn,
+                spec.task_id,
+                "governance_product_completed",
+                {
+                    "dedupe_key": dedupe,
+                    "reservation_id": product_reservation_id,
+                    "prompt_hash": prompt_hash,
+                    "evidence": evidence,
+                    "completed_at": int(time.time()),
+                },
+            )
+            product_events = [
+                event
+                for event in _events(conn, spec.task_id, "governance_product_completed")
+                if (event.payload or {}).get("dedupe_key") == dedupe
+            ]
 
     if not success_events:
-        attempts = [
-            event for event in _events(conn, spec.task_id)
-            if event.kind in ("governance_delivery_failed", "governance_delivery_succeeded")
-            and (event.payload or {}).get("dedupe_key") == dedupe
-        ]
-        if len(attempts) >= MAX_DELIVERY_ATTEMPTS:
-            blocker_key = f"delivery-exhausted:{dedupe}"
-            _sticky_block_once(conn, spec.task_id, "delivery-exhausted: manual intervention required")
-            _pause_once(conn, spec.task_id, blocker_key, "delivery retry exhausted", pause_scheduler)
-            return False
-        attempt = len(attempts) + 1
-        body = (
-            f"{summary}\n\n"
-            f"Protocol: {PROTOCOL_VERSION}\n"
-            f"Task: {spec.task_id}\n"
-            f"Commit pin: {spec.expected_commit}\n"
-            f"Prompt hash: {prompt_hash}\n"
-            f"Dedupe: {dedupe}\n\n"
-            f"<!-- hermes-governed-review:{dedupe} -->"
+        delivery_state, attempt, delivery_reservation_id = _reserve_delivery_attempt(
+            conn, spec.task_id, dedupe
         )
-        try:
-            sender(spec.delivery, body)
-        except Exception as exc:
+        if delivery_state == "unknown":
+            assert attempt is not None
+            _record_delivery_reconciliation(
+                conn,
+                spec,
+                dedupe=dedupe,
+                attempt=attempt,
+                pause_scheduler=pause_scheduler,
+            )
+            return False
+        if delivery_state == "exhausted":
+            blocker_key = f"delivery-exhausted:{dedupe}"
+            _sticky_block_once(
+                conn,
+                spec.task_id,
+                "delivery-exhausted: manual intervention required",
+            )
+            _pause_once(
+                conn,
+                spec.task_id,
+                blocker_key,
+                "delivery retry exhausted",
+                pause_scheduler,
+            )
+            return False
+        if delivery_state == "succeeded":
+            success_events = [
+                event
+                for event in _events(conn, spec.task_id, "governance_delivery_succeeded")
+                if (event.payload or {}).get("dedupe_key") == dedupe
+            ]
+        elif delivery_state == "owner":
+            assert attempt is not None and delivery_reservation_id is not None
+            body = (
+                f"{summary}\n\n"
+                f"Protocol: {PROTOCOL_VERSION}\n"
+                f"Task: {spec.task_id}\n"
+                f"Commit pin: {spec.expected_commit}\n"
+                f"Prompt hash: {prompt_hash}\n"
+                f"Dedupe: {dedupe}\n\n"
+                f"<!-- hermes-governed-review:{dedupe} -->"
+            )
+            try:
+                sender(spec.delivery, body)
+            except Exception as exc:
+                _append(
+                    conn,
+                    spec.task_id,
+                    "governance_delivery_failed",
+                    {
+                        "dedupe_key": dedupe,
+                        "attempt": attempt,
+                        "reservation_id": delivery_reservation_id,
+                        "error": str(exc)[:500],
+                        "delivery_only_retry_available": attempt < MAX_DELIVERY_ATTEMPTS,
+                    },
+                )
+                _sticky_block_once(
+                    conn, spec.task_id, f"delivery-failed: {str(exc)[:300]}"
+                )
+                _pause_once(
+                    conn,
+                    spec.task_id,
+                    f"delivery-failed:{dedupe}:{attempt}",
+                    f"delivery attempt {attempt} failed",
+                    pause_scheduler,
+                )
+                return False
             _append(
                 conn,
                 spec.task_id,
-                "governance_delivery_failed",
+                "governance_delivery_succeeded",
                 {
                     "dedupe_key": dedupe,
                     "attempt": attempt,
-                    "error": str(exc)[:500],
-                    "delivery_only_retry_available": attempt < MAX_DELIVERY_ATTEMPTS,
+                    "reservation_id": delivery_reservation_id,
+                    "target": f"{spec.delivery.repository}#{spec.delivery.issue}",
                 },
             )
-            _sticky_block_once(conn, spec.task_id, f"delivery-failed: {str(exc)[:300]}")
+            success_events = [
+                event
+                for event in _events(conn, spec.task_id, "governance_delivery_succeeded")
+                if (event.payload or {}).get("dedupe_key") == dedupe
+            ]
+        else:
             return False
-        _append(
+
+    child_hold_errors = _hold_governed_children(conn, spec.task_id)
+    if child_hold_errors:
+        _record_execution_block(
             conn,
-            spec.task_id,
-            "governance_delivery_succeeded",
-            {
-                "dedupe_key": dedupe,
-                "attempt": attempt,
-                "target": f"{spec.delivery.repository}#{spec.delivery.issue}",
-            },
+            spec,
+            prompt_hash=prompt_hash,
+            dedupe=dedupe,
+            errors=child_hold_errors,
+            pause_scheduler=pause_scheduler,
         )
+        return False
 
     product_payload = product_events[-1].payload or {}
     metadata = {

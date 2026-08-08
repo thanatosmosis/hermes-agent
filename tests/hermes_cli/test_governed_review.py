@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -73,6 +75,8 @@ def pass_preflight(conn, spec: gr.GovernedReviewSpec) -> gr.PreflightResult:
 
 
 def complete_ready(conn, spec: gr.GovernedReviewSpec, **kwargs) -> bool:
+    kwargs.setdefault("profile_resolver", lambda profile: bool(profile))
+    kwargs.setdefault("skill_resolver", lambda profile, skill: True)
     return gr.complete_with_issue_delivery(
         conn,
         spec,
@@ -111,6 +115,58 @@ def test_preflight_passes_with_exact_pin_profile_skills_dependencies_and_deliver
     events = gr._events(conn, task_id, "governance_preflight_passed")
     assert len(events) == 1
     assert events[0].payload["dedupe_key"] == result.dedupe_key
+
+
+def test_identity_change_requires_and_accepts_fresh_preflight(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+
+    stale_task = kb.create_task(conn, title="stale", assignee="worker")
+    assert kb.claim_task(conn, stale_task)
+    stale_spec = make_spec(stale_task, workspace, head, branch)
+    pass_preflight(conn, stale_spec)
+    conn.execute("UPDATE tasks SET assignee='reviewer' WHERE id=?", (stale_task,))
+    product_calls: list[str] = []
+
+    assert not complete_ready(
+        conn,
+        stale_spec,
+        summary="must not run",
+        product_work=lambda: product_calls.append("stale") or {},
+        sender=lambda target, body: None,
+        profile_resolver=lambda profile: profile in {"worker", "reviewer"},
+    )
+    assert product_calls == []
+
+    refreshed_task = kb.create_task(conn, title="refreshed", assignee="worker")
+    assert kb.claim_task(conn, refreshed_task)
+    refreshed_spec = make_spec(refreshed_task, workspace, head, branch)
+    pass_preflight(conn, refreshed_spec)
+    conn.execute("UPDATE tasks SET assignee='reviewer' WHERE id=?", (refreshed_task,))
+    refreshed = gr.preflight_governed_review(
+        conn,
+        refreshed_spec,
+        profile_resolver=lambda profile: profile == "reviewer",
+        skill_resolver=lambda profile, skill: True,
+        delivery_readiness=delivery_ready,
+    )
+
+    assert refreshed.ok
+    passes = gr._events(conn, refreshed_task, "governance_preflight_passed")
+    assert len(passes) == 2
+    refreshed_payload = passes[-1].payload
+    assert refreshed_payload is not None
+    assert refreshed_payload["actual_profile"] == "reviewer"
+    assert complete_ready(
+        conn,
+        refreshed_spec,
+        summary="fresh identity",
+        product_work=lambda: product_calls.append("fresh") or {"commit": head},
+        sender=lambda target, body: None,
+        profile_resolver=lambda profile: profile == "reviewer",
+    )
+    assert product_calls == ["fresh"]
 
 
 def test_preflight_fail_closed_is_single_durable_block_and_scheduler_pause(
@@ -345,6 +401,263 @@ def test_delivery_only_retry_refuses_replayed_delivery_hold_without_rerunning_pr
     assert len(sends) == 1
 
 
+def test_atomic_product_reservation_blocks_concurrent_and_reentrant_callbacks(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    assert kb.claim_task(conn, task_id)
+    spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    product_calls: list[str] = []
+    reentrant_results: list[bool] = []
+    thread_results: list[bool] = []
+    thread_errors: list[BaseException] = []
+
+    def invoke() -> None:
+        local = kb.connect(db_path)
+
+        def product_work():
+            product_calls.append("ran")
+            reentrant_results.append(
+                complete_ready(
+                    local,
+                    spec,
+                    summary="reentrant",
+                    product_work=lambda: {"must": "not run"},
+                    sender=lambda target, body: None,
+                )
+            )
+            callback_entered.set()
+            assert release_callback.wait(5)
+            return {"commit": head}
+
+        try:
+            thread_results.append(
+                complete_ready(
+                    local,
+                    spec,
+                    summary="done",
+                    product_work=product_work,
+                    sender=lambda target, body: None,
+                )
+            )
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            local.close()
+
+    owner = threading.Thread(target=invoke)
+    owner.start()
+    assert callback_entered.wait(5)
+    contender = threading.Thread(target=invoke)
+    contender.start()
+    contender.join(5)
+    assert not contender.is_alive()
+    release_callback.set()
+    owner.join(5)
+
+    assert not owner.is_alive()
+    assert thread_errors == []
+    assert reentrant_results == [False]
+    assert sorted(thread_results) == [False, True]
+    assert product_calls == ["ran"]
+    assert len(gr._events(conn, task_id, "governance_product_reserved")) == 1
+    assert len(gr._events(conn, task_id, "governance_product_completed")) == 1
+
+
+def test_delivery_reservation_is_atomic_under_concurrent_retry(conn, git_workspace) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    assert kb.claim_task(conn, task_id)
+    spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
+    sends: list[str] = []
+
+    def first_failure(target, body):
+        sends.append("first")
+        raise RuntimeError("offline")
+
+    assert not complete_ready(
+        conn,
+        spec,
+        summary="done",
+        product_work=lambda: {"commit": head},
+        sender=first_failure,
+    )
+
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    retry_entered = threading.Event()
+    release_retry = threading.Event()
+    results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def retry_sender(target, body):
+        sends.append("retry")
+        retry_entered.set()
+        assert release_retry.wait(5)
+
+    def invoke_retry() -> None:
+        local = kb.connect(db_path)
+        try:
+            results.append(
+                complete_ready(
+                    local,
+                    spec,
+                    summary="done",
+                    product_work=lambda: {"must": "not rerun"},
+                    sender=retry_sender,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            local.close()
+
+    owner = threading.Thread(target=invoke_retry)
+    owner.start()
+    assert retry_entered.wait(5)
+    contender = threading.Thread(target=invoke_retry)
+    contender.start()
+    contender.join(5)
+    assert not contender.is_alive()
+    release_retry.set()
+    owner.join(5)
+
+    assert not owner.is_alive()
+    assert errors == []
+    assert sorted(results) == [False, True]
+    assert sends == ["first", "retry"]
+    reservations = gr._events(conn, task_id, "governance_delivery_reserved")
+    assert [event.payload["attempt"] for event in reservations] == [1, 2]
+    assert len(gr._events(conn, task_id, "governance_delivery_reconciliation_required")) == 1
+
+
+def test_interrupted_delivery_is_never_automatically_resent(conn, git_workspace) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    assert kb.claim_task(conn, task_id)
+    spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
+    sends: list[str] = []
+
+    class SimulatedInterruption(BaseException):
+        pass
+
+    def interrupted_sender(target, body):
+        sends.append(body)
+        raise SimulatedInterruption()
+
+    with pytest.raises(SimulatedInterruption):
+        complete_ready(
+            conn,
+            spec,
+            summary="done",
+            product_work=lambda: {"commit": head},
+            sender=interrupted_sender,
+        )
+
+    assert not complete_ready(
+        conn,
+        spec,
+        summary="done",
+        product_work=lambda: {"must": "not rerun"},
+        sender=interrupted_sender,
+    )
+    assert len(sends) == 1
+    assert len(gr._events(conn, task_id, "governance_delivery_reserved")) == 1
+    assert gr._events(conn, task_id, "governance_delivery_failed") == []
+    assert len(gr._events(conn, task_id, "governance_delivery_reconciliation_required")) == 1
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_execution_and_delivery_retry_freshly_resolve_profile_and_skills(
+    conn, git_workspace
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(
+        conn, title="candidate", assignee="worker", skills=["required-skill"]
+    )
+    assert kb.claim_task(conn, task_id)
+    spec = make_spec(task_id, workspace, head, branch)
+    pass_preflight(conn, spec)
+    profile_calls: list[str] = []
+    skill_calls: list[tuple[str, str]] = []
+    skill_available = True
+    sends: list[str] = []
+
+    def profile_resolver(profile: str) -> bool:
+        profile_calls.append(profile)
+        return True
+
+    def skill_resolver(profile: str, skill: str) -> bool:
+        skill_calls.append((profile, skill))
+        return skill_available
+
+    def failing_sender(target, body):
+        sends.append(body)
+        raise RuntimeError("offline")
+
+    assert not complete_ready(
+        conn,
+        spec,
+        summary="done",
+        product_work=lambda: {"commit": head},
+        sender=failing_sender,
+        profile_resolver=profile_resolver,
+        skill_resolver=skill_resolver,
+    )
+    skill_available = False
+    assert not complete_ready(
+        conn,
+        spec,
+        summary="done",
+        product_work=lambda: {"must": "not rerun"},
+        sender=failing_sender,
+        profile_resolver=profile_resolver,
+        skill_resolver=skill_resolver,
+    )
+
+    assert profile_calls == ["worker", "worker"]
+    assert skill_calls == [
+        ("worker", "required-skill"),
+        ("worker", "required-skill"),
+    ]
+    assert len(sends) == 1
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("rollback_path", ""),
+        ("rollback_path", "TBD"),
+        ("rollback_path", "This text has many words but nothing useful"),
+        ("pause_path", "placeholder"),
+        ("pause_path", "handle the scheduler somehow later"),
+    ],
+)
+def test_preflight_rejects_non_concrete_rollback_and_pause_procedures(
+    conn, git_workspace, field_name: str, value: str
+) -> None:
+    workspace, head, branch = git_workspace
+    task_id = kb.create_task(conn, title="candidate", assignee="worker")
+    spec = replace(make_spec(task_id, workspace, head, branch), **{field_name: value})
+
+    result = gr.preflight_governed_review(
+        conn,
+        spec,
+        profile_resolver=lambda profile: True,
+        skill_resolver=lambda profile, skill: True,
+        delivery_readiness=delivery_ready,
+    )
+
+    assert not result.ok
+    assert any("concrete, actionable procedure" in error for error in result.errors)
+
+
 def test_delivery_retry_is_idempotent_does_not_rerun_product_and_releases_one_child(
     conn, git_workspace
 ) -> None:
@@ -380,8 +693,13 @@ def test_delivery_retry_is_idempotent_does_not_rerun_product_and_releases_one_ch
     assert len(product_calls) == 1
     assert len(delivery_calls) == 2
     assert delivery_calls[0] == delivery_calls[1]
-    assert kb.get_task(conn, child_a).status == "todo"
-    assert kb.get_task(conn, child_b).status == "todo"
+    assert kb.get_task(conn, child_a).status == "blocked"
+    assert kb.get_task(conn, child_b).status == "blocked"
+    assert len(gr._events(conn, parent, "governance_child_held")) == 2
+    for _ in range(3):
+        assert kb.recompute_ready(conn) == 0
+    assert kb.claim_task(conn, child_a) is None
+    assert kb.claim_task(conn, child_b) is None
 
     # A manually held child stays sticky while the reviewer explicitly releases
     # only its sibling.
@@ -422,13 +740,15 @@ def test_delivery_exhaustion_blocks_and_pauses_without_third_send(conn, git_work
         raise RuntimeError("offline")
 
     assert not complete_ready(
-        conn, spec, summary="done", product_work=product_work, sender=failing_sender
+        conn,
+        spec,
+        summary="done",
+        product_work=product_work,
+        sender=failing_sender,
+        pause_scheduler=pauses.append,
     )
+    assert len(pauses) == 1
     # Delivery-only retry is allowed from the preserved blocked state.
-    assert not complete_ready(
-        conn, spec, summary="done", product_work=product_work, sender=failing_sender
-    )
-    # Third invocation is rejected before send and pauses the scheduler once.
     assert not complete_ready(
         conn,
         spec,
@@ -437,9 +757,22 @@ def test_delivery_exhaustion_blocks_and_pauses_without_third_send(conn, git_work
         sender=failing_sender,
         pause_scheduler=pauses.append,
     )
+    assert len(pauses) == 2
+    # Exhaustion is also paused once and repeated checks are idempotent.
+    for _ in range(2):
+        assert not complete_ready(
+            conn,
+            spec,
+            summary="done",
+            product_work=product_work,
+            sender=failing_sender,
+            pause_scheduler=pauses.append,
+        )
     assert len(product_calls) == 1
     assert len(sends) == 2
-    assert len(pauses) == 1
+    assert len(pauses) == 3
+    assert len(gr._events(conn, task_id, "governance_delivery_failed")) == 2
+    assert len(gr._events(conn, task_id, "governance_scheduler_paused")) == 3
     assert kb.get_task(conn, task_id).status == "blocked"
 
 
